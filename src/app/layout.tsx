@@ -11,8 +11,20 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://betterme.june8th.net"),
   title: "betterme — 매일 운동 기록 스탬프 챌린지",
   description: "매일 나를 바꾸는 운동 기록, betterme — 나만의 데일리 운동 달력 스탬프 챌린지",
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    title: "betterme — 매일 운동 기록 스탬프 챌린지",
+    description: "매일 나를 바꾸는 운동 기록, betterme — 나만의 데일리 운동 달력 스탬프 챌린지",
+    url: "https://betterme.june8th.net",
+    siteName: "betterme",
+    locale: "ko_KR",
+    type: "website",
+  },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",

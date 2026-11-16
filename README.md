@@ -1,5 +1,7 @@
 # betterme — 매일 운동 기록 스탬프 챌린지
 
+🔗 **Live Web App**: [https://betterme.june8th.net](https://betterme.june8th.net)
+
 **betterme**는 아이폰(iOS Safari) 및 모바일 환경에 최적화된 데일리 운동 기록 스탬프 달력 Next.js PWA(Progressive Web App) 웹 애플리케이션입니다.
 
 ## 주요 기능
@@ -36,13 +38,13 @@ git commit -m "feat: update betterme workout tracker"
 git push origin main
 ```
 
-1. [Vercel 대시보드](https://vercel.com/new)에서 GitHub `betterme` 저장소를 Import 하면 **Next.js** 프리셋으로 자동 배포됩니다.
-2. 또는 터미널에서 `npx vercel --prod` 명령어로 즉시 배포할 수 있습니다.
+1. `main` 브랜치 푸시 시 Vercel과 연결된 공식 도메인([https://betterme.june8th.net](https://betterme.june8th.net))으로 자동 배포됩니다.
+2. 신규 연결 시 [Vercel 대시보드](https://vercel.com/new)에서 GitHub `betterme` 저장소를 Import 하면 **Next.js** 프리셋으로 자동 배포되며, 터미널에서 `npx vercel --prod` 명령어로도 즉시 배포할 수 있습니다.
 
 ---
 
 ## 아이폰(iPhone) 홈 화면에 추가하는 방법 (Safari)
 
-1. 아이폰 **Safari**에서 배포된 `betterme` URL에 접속합니다.
+1. 아이폰 **Safari**에서 [https://betterme.june8th.net](https://betterme.june8th.net)에 접속합니다.
 2. 하단 **공유 버튼**을 탭한 뒤 **'홈 화면에 추가'**를 선택합니다.
 3. 우측 상단 **'추가'**를 누르면 홈 화면 아이콘으로 전체 화면(`standalone`) 실행이 가능합니다.
