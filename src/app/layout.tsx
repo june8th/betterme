@@ -7,12 +7,12 @@ export const viewport: Viewport = {
   maximumScale: 1,
   userScalable: false,
   viewportFit: "cover",
-  themeColor: "#ffffff",
+  themeColor: "#FAF7F2",
 };
 
 export const metadata: Metadata = {
-  title: "betterme",
-  description: "Hello World — betterme mobile app",
+  title: "betterme — 매일 운동 기록 스탬프 챌린지",
+  description: "매일 나를 바꾸는 운동 기록, betterme — 나만의 데일리 운동 달력 스탬프 챌린지",
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
@@ -31,8 +31,8 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ko">
-      <body className="antialiased selection:bg-indigo-500 selection:text-white">
-        <div className="max-w-[430px] mx-auto min-h-dvh bg-slate-50 shadow-2xl relative flex flex-col overflow-hidden">
+      <body className="antialiased text-[#2C2A27] selection:bg-[#6CA824]/20 selection:text-[#2C2A27]">
+        <div className="max-w-[430px] mx-auto min-h-dvh bg-[#FAF7F2] shadow-[0_0_50px_rgba(44,42,39,0.10)] relative flex flex-col overflow-x-clip">
           {children}
         </div>
       </body>

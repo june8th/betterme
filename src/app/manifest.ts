@@ -2,13 +2,13 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "betterme",
+    name: "betterme — 매일 운동 기록 스탬프 챌린지",
     short_name: "betterme",
-    description: "Make a better me, every single day.",
+    description: "매일 나를 바꾸는 운동 기록, betterme — 나만의 데일리 운동 달력 스탬프 챌린지",
     start_url: "/",
     display: "standalone",
-    background_color: "#f8fafc",
-    theme_color: "#0f172a",
+    background_color: "#FAF7F2",
+    theme_color: "#FAF7F2",
     orientation: "portrait",
     icons: [
       {
