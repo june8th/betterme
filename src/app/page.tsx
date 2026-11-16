@@ -56,7 +56,7 @@ export default function HomePage() {
                 Welcome to betterme
               </p>
               <h1 className="text-4xl font-black tracking-tight text-white">
-                Hello World! 👋
+                Hello World! 🚀
               </h1>
               <p className="text-sm font-medium text-slate-200 pt-1 leading-relaxed">
                 더 나은 나를 만드는 시작, <span className="text-white font-semibold">betterme</span>
