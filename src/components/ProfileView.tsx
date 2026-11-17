@@ -15,12 +15,7 @@ export interface ProfileViewProps {
   onSwitchNickname: (nickname: string) => Promise<void> | void;
   onRenameNickname: (newNickname: string) => Promise<boolean> | boolean;
   onLogout: () => void;
-  onChangeWeeklyGoal: (goal: number) => Promise<void> | void;
-  onExportBackup: () => string;
-  onImportBackup: (rawJson: string) => Promise<{ ok: boolean; message: string }>;
 }
-
-const WEEKLY_GOALS = [1, 2, 3, 4, 5, 6, 7];
 
 export default function ProfileView({
   profile,
@@ -29,9 +24,6 @@ export default function ProfileView({
   onSwitchNickname,
   onRenameNickname,
   onLogout,
-  onChangeWeeklyGoal,
-  onExportBackup,
-  onImportBackup,
 }: ProfileViewProps) {
   const { currentStreak, bestStreak, totalCompleted } = useMemo(
     () => calculateStreaks(profile.workouts),
@@ -50,15 +42,6 @@ export default function ProfileView({
   // Switch / add new user state
   const [switchInput, setSwitchInput] = useState("");
   const [switchBusy, setSwitchBusy] = useState(false);
-
-  // Collapsible backup & restore state
-  const [backupOpen, setBackupOpen] = useState(false);
-  const [backupInput, setBackupInput] = useState("");
-  const [backupStatus, setBackupStatus] = useState<{
-    ok: boolean;
-    text: string;
-  } | null>(null);
-  const [importBusy, setImportBusy] = useState(false);
 
   useEffect(() => {
     setRenameDraft(profile.nickname);
@@ -153,49 +136,6 @@ export default function ProfileView({
       setRenameFeedback(null);
     } finally {
       setSwitchBusy(false);
-    }
-  };
-
-  const handleCopyBackup = async () => {
-    const raw = onExportBackup();
-    try {
-      if (navigator?.clipboard?.writeText) {
-        await navigator.clipboard.writeText(raw);
-        setBackupStatus({
-          ok: true,
-          text: "클립보드에 백업 데이터가 복사되었어요 ✓",
-        });
-        return;
-      }
-    } catch {
-      // Fallback below if clipboard permission is blocked
-    }
-    setBackupInput(raw);
-    setBackupStatus({
-      ok: true,
-      text: "아래 입력창에 백업 JSON을 채워 두었어요. 전체 선택해 복사해 주세요.",
-    });
-  };
-
-  const handleRestoreBackup = async () => {
-    const trimmed = backupInput.trim();
-    if (!trimmed) {
-      setBackupStatus({
-        ok: false,
-        text: "복원할 백업 JSON 데이터를 먼저 붙여넣어 주세요.",
-      });
-      return;
-    }
-    setImportBusy(true);
-    setBackupStatus(null);
-    try {
-      const res = await onImportBackup(trimmed);
-      setBackupStatus({ ok: res.ok, text: res.message });
-      if (res.ok) {
-        setBackupInput("");
-      }
-    } finally {
-      setImportBusy(false);
     }
   };
 
@@ -348,43 +288,7 @@ export default function ProfileView({
         </div>
       </section>
 
-      {/* 3. Weekly Goal Selector */}
-      <section className="rounded-[28px] bg-white p-5 border border-[#ECE5D8] shadow-[0_8px_30px_rgb(44,42,39,0.05)]">
-        <div className="flex items-center justify-between mb-3">
-          <div>
-            <h3 className="text-sm font-bold text-[#2C2A27]">주간 운동 목표</h3>
-            <p className="text-xs text-[#7D766B] mt-0.5">
-              일주일에 실천할 목표 운동 횟수를 선택하세요
-            </p>
-          </div>
-          <span className="rounded-full bg-[#6CA824]/12 text-[#5B8E1D] text-xs font-bold px-2.5 py-1">
-            주 {profile.weeklyGoal}회
-          </span>
-        </div>
-
-        <div className="grid grid-cols-7 gap-1.5">
-          {WEEKLY_GOALS.map((goal) => {
-            const active = profile.weeklyGoal === goal;
-            return (
-              <button
-                key={goal}
-                type="button"
-                onClick={() => onChangeWeeklyGoal(goal)}
-                className={`rounded-2xl py-2.5 text-xs font-semibold transition flex flex-col items-center justify-center ${
-                  active
-                    ? "bg-[#6CA824] text-white shadow-[0_4px_12px_rgba(108,168,36,0.3)]"
-                    : "bg-[#FAF7F2] text-[#5B554C] hover:bg-[#F1ECE2] border border-[#EAE3D5]"
-                }`}
-              >
-                <span className="text-[10px] opacity-85">주</span>
-                <span className="text-xs font-bold">{goal}회</span>
-              </button>
-            );
-          })}
-        </div>
-      </section>
-
-      {/* 4. User Switcher / Add New User */}
+      {/* 3. User Switcher / Add New User */}
       <section className="rounded-[28px] bg-white p-5 border border-[#ECE5D8] shadow-[0_8px_30px_rgb(44,42,39,0.05)]">
         <div className="mb-3">
           <h3 className="text-sm font-bold text-[#2C2A27]">
@@ -448,106 +352,6 @@ export default function ProfileView({
             다른 사용자로 전환
           </button>
         </form>
-      </section>
-
-      {/* 5. Collapsible Backup & Restore */}
-      <section className="rounded-[28px] bg-white border border-[#ECE5D8] shadow-[0_8px_30px_rgb(44,42,39,0.05)] overflow-hidden">
-        <button
-          type="button"
-          onClick={() => setBackupOpen((prev) => !prev)}
-          className="w-full px-5 py-4 flex items-center justify-between text-left hover:bg-[#FAF7F2]/60 transition"
-        >
-          <div>
-            <h3 className="text-sm font-bold text-[#2C2A27]">
-              기록 백업 & 복원
-            </h3>
-            <p className="text-xs text-[#7D766B] mt-0.5">
-              다른 기기로 운동 기록을 옮기거나 안전하게 보관하세요
-            </p>
-          </div>
-          <span
-            className={`w-7 h-7 rounded-full bg-[#FAF7F2] border border-[#EAE3D5] flex items-center justify-center text-[#5B554C] transition-transform ${
-              backupOpen ? "rotate-180" : ""
-            }`}
-          >
-            <svg
-              className="w-4 h-4"
-              viewBox="0 0 20 20"
-              fill="none"
-              aria-hidden="true"
-            >
-              <path
-                d="M5.5 7.5L10 12L14.5 7.5"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-          </span>
-        </button>
-
-        {backupOpen && (
-          <div className="px-5 pb-5 pt-1 border-t border-[#F2ECE1] space-y-3">
-            <button
-              type="button"
-              onClick={handleCopyBackup}
-              className="w-full rounded-2xl bg-[#FAF7F2] hover:bg-[#F1ECE2] border border-[#E5DEC9] py-3 px-4 text-xs font-semibold text-[#2C2A27] transition flex items-center justify-center gap-1.5"
-            >
-              <svg
-                className="w-4 h-4 text-[#6CA824]"
-                viewBox="0 0 20 20"
-                fill="none"
-                aria-hidden="true"
-              >
-                <rect
-                  x="7"
-                  y="7"
-                  width="9"
-                  height="9"
-                  rx="2"
-                  stroke="currentColor"
-                  strokeWidth="1.7"
-                />
-                <path
-                  d="M4 13V5C4 3.89543 4.89543 3 6 3H12"
-                  stroke="currentColor"
-                  strokeWidth="1.7"
-                  strokeLinecap="round"
-                />
-              </svg>
-              <span>백업 데이터 복사</span>
-            </button>
-
-            <div className="space-y-2">
-              <textarea
-                rows={4}
-                value={backupInput}
-                onChange={(e) => setBackupInput(e.target.value)}
-                placeholder="복사한 백업 JSON 데이터를 여기에 붙여넣어 주세요"
-                className="w-full rounded-2xl bg-[#FAF7F2] border border-[#E5DEC9] p-3 text-[16px] leading-snug text-[#2C2A27] placeholder:text-[#A39C90] focus:outline-none focus:border-[#6CA824] focus:ring-2 focus:ring-[#6CA824]/20 resize-none"
-              />
-              <button
-                type="button"
-                disabled={importBusy}
-                onClick={handleRestoreBackup}
-                className="w-full rounded-2xl bg-[#6CA824] hover:bg-[#5E941E] disabled:opacity-60 text-white py-3 px-4 text-xs font-semibold shadow-[0_4px_14px_rgba(108,168,36,0.24)] transition"
-              >
-                {importBusy ? "복원하는 중..." : "백업 데이터 붙여넣어 복원"}
-              </button>
-            </div>
-
-            {backupStatus && (
-              <p
-                className={`text-xs font-medium ${
-                  backupStatus.ok ? "text-[#5B8E1D]" : "text-[#C94A38]"
-                }`}
-              >
-                {backupStatus.text}
-              </p>
-            )}
-          </div>
-        )}
       </section>
     </div>
   );

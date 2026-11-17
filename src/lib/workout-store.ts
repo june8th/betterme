@@ -2,12 +2,23 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isFutureDateKey } from "@/lib/date-utils";
+import { matchWorkoutEmoji } from "@/lib/emoji-matcher";
 import {
+  DEFAULT_WORKOUT_CATEGORIES,
+  getEntryCategoryIds,
   UserProfileData,
-  WORKOUT_CATEGORIES,
   WorkoutCategory,
+  WorkoutCategoryMeta,
   WorkoutEntry,
 } from "@/lib/workout-types";
+
+export interface SaveWorkoutDetailInput {
+  completed: boolean;
+  categories?: WorkoutCategory[];
+  category?: WorkoutCategory;
+  durationMinutes?: number;
+  note?: string;
+}
 
 export interface UseWorkoutStoreResult {
   hydrated: boolean;
@@ -23,18 +34,24 @@ export interface UseWorkoutStoreResult {
   logoutNickname: () => void;
   renameActiveNickname: (newNickname: string) => Promise<boolean>;
   setWeeklyGoal: (goal: number) => Promise<void>;
+  addWorkoutCategory: (
+    label: string
+  ) => Promise<{ ok: boolean; message?: string; category?: WorkoutCategoryMeta }>;
+  removeWorkoutCategory: (categoryId: WorkoutCategory) => Promise<void>;
+  moveWorkoutCategory: (
+    categoryId: WorkoutCategory,
+    direction: "up" | "down"
+  ) => Promise<void>;
+  resetWorkoutCategories: () => Promise<void>;
   toggleWorkoutDay: (dateKey: string) => Promise<boolean>;
   saveWorkoutDetail: (
     dateKey: string,
-    detail: {
-      completed: boolean;
-      category?: WorkoutCategory;
-      durationMinutes?: number;
-      note?: string;
-    }
+    detail: SaveWorkoutDetailInput
   ) => Promise<void>;
   exportBackupJson: () => string;
-  importBackupJson: (rawJson: string) => Promise<{ ok: boolean; message: string }>;
+  importBackupJson: (
+    rawJson: string
+  ) => Promise<{ ok: boolean; message: string }>;
 }
 
 interface SavedNicknameItem {
@@ -56,9 +73,31 @@ interface WorkoutsApiResponse {
 
 const STORAGE_KEY = "betterme_store_v1";
 
-const VALID_CATEGORIES = new Set<WorkoutCategory>(
-  WORKOUT_CATEGORIES.map((item) => item.id)
-);
+function cloneDefaultCategories(): WorkoutCategoryMeta[] {
+  return DEFAULT_WORKOUT_CATEGORIES.map((item) => ({ ...item }));
+}
+
+function buildDefaultArchivedCategories(): Record<string, WorkoutCategoryMeta> {
+  const map: Record<string, WorkoutCategoryMeta> = {};
+  for (const item of DEFAULT_WORKOUT_CATEGORIES) {
+    map[item.id] = { ...item };
+  }
+  return map;
+}
+
+function areDefaultCategories(categories: WorkoutCategoryMeta[]): boolean {
+  if (categories.length !== DEFAULT_WORKOUT_CATEGORIES.length) {
+    return false;
+  }
+  for (let i = 0; i < DEFAULT_WORKOUT_CATEGORIES.length; i += 1) {
+    const a = categories[i];
+    const b = DEFAULT_WORKOUT_CATEGORIES[i];
+    if (a.id !== b.id || a.label !== b.label || a.emoji !== b.emoji) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function normalizeNicknameKey(nickname: string): string {
   return nickname.trim().toLowerCase();
@@ -73,7 +112,126 @@ function compareIsoTimestamps(a?: string, b?: string): number {
   return String(a ?? "").localeCompare(String(b ?? ""));
 }
 
-function sanitizeWorkoutEntry(
+function sanitizeCategoryId(raw: unknown): WorkoutCategory | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const trimmed = raw.trim().slice(0, 64).trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function sanitizeCategoryMeta(
+  raw: unknown,
+  fallbackId?: string
+): WorkoutCategoryMeta | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const candidate = raw as Partial<WorkoutCategoryMeta>;
+  const id = sanitizeCategoryId(candidate.id ?? fallbackId);
+  const label =
+    typeof candidate.label === "string"
+      ? candidate.label.trim().slice(0, 40).trim()
+      : "";
+  if (!id || !label) {
+    return null;
+  }
+  const rawEmoji =
+    typeof candidate.emoji === "string" ? candidate.emoji.trim() : "";
+  const emoji = rawEmoji || matchWorkoutEmoji(label);
+  return { id, label, emoji };
+}
+
+function sanitizeEntryCategories(
+  rawCategories: unknown,
+  rawCategory: unknown
+): WorkoutCategory[] {
+  if (Array.isArray(rawCategories)) {
+    if (rawCategories.length === 0) {
+      return [];
+    }
+    const seen = new Set<string>();
+    const result: WorkoutCategory[] = [];
+    for (const item of rawCategories) {
+      const cleanId = sanitizeCategoryId(item);
+      if (cleanId && !seen.has(cleanId)) {
+        seen.add(cleanId);
+        result.push(cleanId);
+      }
+    }
+    if (result.length > 0) {
+      return result;
+    }
+    const fallbackSingle = sanitizeCategoryId(rawCategory);
+    return fallbackSingle ? [fallbackSingle] : [];
+  }
+
+  const single = sanitizeCategoryId(rawCategory);
+  return single ? [single] : [];
+}
+
+function sanitizeArchivedCategories(
+  rawArchived: unknown,
+  activeCategories: WorkoutCategoryMeta[]
+): Record<string, WorkoutCategoryMeta> {
+  const archived: Record<string, WorkoutCategoryMeta> = {};
+
+  if (
+    rawArchived &&
+    typeof rawArchived === "object" &&
+    !Array.isArray(rawArchived)
+  ) {
+    for (const [key, value] of Object.entries(
+      rawArchived as Record<string, unknown>
+    )) {
+      const cleanMeta = sanitizeCategoryMeta(value, key);
+      if (cleanMeta) {
+        archived[cleanMeta.id] = cleanMeta;
+      }
+    }
+  }
+
+  for (const cat of activeCategories) {
+    archived[cat.id] = { ...cat };
+  }
+
+  return archived;
+}
+
+function hashStringForId(input: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function createCustomCategoryId(
+  label: string,
+  existingIds: Set<string>
+): WorkoutCategory {
+  const asciiSlug = label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 20);
+  const base = asciiSlug
+    ? `cat-${asciiSlug}`
+    : `cat-${hashStringForId(label.toLowerCase())}`;
+
+  if (!existingIds.has(base)) {
+    return base;
+  }
+
+  let suffix = 2;
+  while (existingIds.has(`${base}-${suffix}`)) {
+    suffix += 1;
+  }
+  return `${base}-${suffix}`.slice(0, 64);
+}
+
+export function sanitizeWorkoutEntry(
   dateKey: string,
   raw: Partial<WorkoutEntry> | undefined,
   fallbackIso: string
@@ -89,11 +247,7 @@ function sanitizeWorkoutEntry(
     return null;
   }
 
-  const category =
-    typeof raw.category === "string" &&
-    VALID_CATEGORIES.has(raw.category as WorkoutCategory)
-      ? (raw.category as WorkoutCategory)
-      : undefined;
+  const categories = sanitizeEntryCategories(raw.categories, raw.category);
 
   const durationMinutes =
     typeof raw.durationMinutes === "number" &&
@@ -115,14 +269,16 @@ function sanitizeWorkoutEntry(
   return {
     date: resolvedDate,
     completed: Boolean(raw.completed),
-    ...(category ? { category } : {}),
+    ...(categories.length > 0
+      ? { categories, category: categories[0] }
+      : {}),
     ...(durationMinutes !== undefined ? { durationMinutes } : {}),
     ...(note ? { note } : {}),
     updatedAt,
   };
 }
 
-function sanitizeProfile(
+export function sanitizeProfile(
   raw: Partial<UserProfileData> | undefined,
   fallbackIso: string
 ): UserProfileData | null {
@@ -150,6 +306,39 @@ function sanitizeProfile(
       ? Math.round(raw.weeklyGoal)
       : 4;
 
+  const hasCategoriesArray = Array.isArray(raw.categories);
+  let categories: WorkoutCategoryMeta[];
+  if (hasCategoriesArray) {
+    const seenIds = new Set<string>();
+    categories = [];
+    for (const rawItem of raw.categories as unknown[]) {
+      const cleanMeta = sanitizeCategoryMeta(rawItem);
+      if (cleanMeta && !seenIds.has(cleanMeta.id)) {
+        seenIds.add(cleanMeta.id);
+        categories.push(cleanMeta);
+      }
+    }
+  } else {
+    categories = cloneDefaultCategories();
+  }
+
+  const archivedCategories = sanitizeArchivedCategories(
+    raw.archivedCategories,
+    categories
+  );
+
+  const explicitCategoriesUpdatedAt =
+    typeof raw.categoriesUpdatedAt === "string" &&
+    raw.categoriesUpdatedAt.trim().length > 0
+      ? raw.categoriesUpdatedAt.trim()
+      : undefined;
+
+  const categoriesUpdatedAt =
+    explicitCategoriesUpdatedAt ??
+    (hasCategoriesArray && !areDefaultCategories(categories)
+      ? updatedAt
+      : undefined);
+
   const workouts: Record<string, WorkoutEntry> = {};
   if (raw.workouts && typeof raw.workouts === "object") {
     for (const [dateKey, entry] of Object.entries(raw.workouts)) {
@@ -165,6 +354,9 @@ function sanitizeProfile(
     createdAt,
     updatedAt,
     weeklyGoal,
+    categories,
+    archivedCategories,
+    ...(categoriesUpdatedAt ? { categoriesUpdatedAt } : {}),
     workouts,
   };
 }
@@ -186,7 +378,77 @@ function mergeWorkouts(
   return merged;
 }
 
-function mergeProfiles(
+function mergeCategoryState(
+  baseProfile: Pick<
+    UserProfileData,
+    "categories" | "archivedCategories" | "categoriesUpdatedAt"
+  >,
+  incomingProfile: Pick<
+    UserProfileData,
+    "categories" | "archivedCategories" | "categoriesUpdatedAt"
+  >,
+  incomingIsNewer: boolean
+): {
+  categories: WorkoutCategoryMeta[];
+  archivedCategories: Record<string, WorkoutCategoryMeta>;
+  categoriesUpdatedAt?: string;
+} {
+  const baseCatTs = baseProfile.categoriesUpdatedAt;
+  const incomingCatTs = incomingProfile.categoriesUpdatedAt;
+
+  let pickIncomingCategories: boolean;
+  let categoriesUpdatedAt: string | undefined;
+
+  if (baseCatTs && incomingCatTs) {
+    pickIncomingCategories = compareIsoTimestamps(incomingCatTs, baseCatTs) >= 0;
+    categoriesUpdatedAt = pickIncomingCategories ? incomingCatTs : baseCatTs;
+  } else if (incomingCatTs && !baseCatTs) {
+    pickIncomingCategories = true;
+    categoriesUpdatedAt = incomingCatTs;
+  } else if (baseCatTs && !incomingCatTs) {
+    pickIncomingCategories = false;
+    categoriesUpdatedAt = baseCatTs;
+  } else {
+    pickIncomingCategories = incomingIsNewer;
+    categoriesUpdatedAt = undefined;
+  }
+
+  const winningCategories = (
+    pickIncomingCategories ? incomingProfile.categories : baseProfile.categories
+  ).map((item) => ({ ...item }));
+
+  const archivedCategories: Record<string, WorkoutCategoryMeta> = {};
+  const olderArchived = pickIncomingCategories
+    ? baseProfile.archivedCategories
+    : incomingProfile.archivedCategories;
+  const newerArchived = pickIncomingCategories
+    ? incomingProfile.archivedCategories
+    : baseProfile.archivedCategories;
+
+  for (const [id, meta] of Object.entries(olderArchived ?? {})) {
+    archivedCategories[id] = { ...meta };
+  }
+  for (const [id, meta] of Object.entries(newerArchived ?? {})) {
+    archivedCategories[id] = { ...meta };
+  }
+  for (const meta of baseProfile.categories) {
+    archivedCategories[meta.id] = { ...meta };
+  }
+  for (const meta of incomingProfile.categories) {
+    archivedCategories[meta.id] = { ...meta };
+  }
+  for (const meta of winningCategories) {
+    archivedCategories[meta.id] = { ...meta };
+  }
+
+  return {
+    categories: winningCategories,
+    archivedCategories,
+    ...(categoriesUpdatedAt ? { categoriesUpdatedAt } : {}),
+  };
+}
+
+export function mergeProfiles(
   baseProfile: UserProfileData,
   incomingProfile: UserProfileData
 ): UserProfileData {
@@ -197,9 +459,25 @@ function mergeProfiles(
   const incomingIsNewer =
     compareIsoTimestamps(incomingProfile.updatedAt, baseProfile.updatedAt) >= 0;
 
+  const mergedCategoryState = mergeCategoryState(
+    baseProfile,
+    incomingProfile,
+    incomingIsNewer
+  );
+
   let latestUpdatedAt = incomingIsNewer
     ? incomingProfile.updatedAt
     : baseProfile.updatedAt;
+
+  if (
+    mergedCategoryState.categoriesUpdatedAt &&
+    compareIsoTimestamps(
+      mergedCategoryState.categoriesUpdatedAt,
+      latestUpdatedAt
+    ) > 0
+  ) {
+    latestUpdatedAt = mergedCategoryState.categoriesUpdatedAt;
+  }
 
   for (const entry of Object.values(mergedWorkouts)) {
     if (compareIsoTimestamps(entry.updatedAt, latestUpdatedAt) > 0) {
@@ -219,6 +497,7 @@ function mergeProfiles(
     weeklyGoal: incomingIsNewer
       ? incomingProfile.weeklyGoal
       : baseProfile.weeklyGoal,
+    ...mergedCategoryState,
     workouts: mergedWorkouts,
   };
 }
@@ -261,6 +540,8 @@ function readLocalStorageState(): LocalStoreState {
           createdAt: nowIso,
           updatedAt: nowIso,
           weeklyGoal: 4,
+          categories: cloneDefaultCategories(),
+          archivedCategories: buildDefaultArchivedCategories(),
           workouts: {},
         };
       } else {
@@ -285,7 +566,9 @@ function writeLocalStorageState(state: LocalStoreState): void {
   }
 }
 
-function countCompletedWorkouts(workouts: Record<string, WorkoutEntry>): number {
+function countCompletedWorkouts(
+  workouts: Record<string, WorkoutEntry>
+): number {
   let count = 0;
   for (const entry of Object.values(workouts)) {
     if (entry?.completed) {
@@ -421,6 +704,8 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
             createdAt: nowIso,
             updatedAt: nowIso,
             weeklyGoal: 4,
+            categories: cloneDefaultCategories(),
+            archivedCategories: buildDefaultArchivedCategories(),
             workouts: {},
           };
 
@@ -455,19 +740,39 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
           if (serverProfile) {
             const latestStore = storeRef.current;
             const latestLocal = latestStore.profiles[key];
-            const hasLocalWorkouts =
-              latestLocal && Object.keys(latestLocal.workouts).length > 0;
+            const hasLocalWorkouts = Boolean(
+              latestLocal && Object.keys(latestLocal.workouts).length > 0
+            );
+            const hasLocalCategoryEdits = Boolean(
+              latestLocal?.categoriesUpdatedAt
+            );
             const mergedWorkouts = latestLocal
               ? mergeWorkouts(serverProfile.workouts, latestLocal.workouts)
               : serverProfile.workouts;
+            const mergedCategoryState = latestLocal
+              ? mergeCategoryState(serverProfile, latestLocal, false)
+              : {
+                  categories: serverProfile.categories.map((item) => ({
+                    ...item,
+                  })),
+                  archivedCategories: sanitizeArchivedCategories(
+                    serverProfile.archivedCategories,
+                    serverProfile.categories
+                  ),
+                  ...(serverProfile.categoriesUpdatedAt
+                    ? { categoriesUpdatedAt: serverProfile.categoriesUpdatedAt }
+                    : {}),
+                };
 
             const hydratedProfile: UserProfileData = {
               nickname: serverProfile.nickname,
               createdAt: serverProfile.createdAt,
-              updatedAt: hasLocalWorkouts
-                ? new Date().toISOString()
-                : serverProfile.updatedAt,
+              updatedAt:
+                hasLocalWorkouts || hasLocalCategoryEdits
+                  ? new Date().toISOString()
+                  : serverProfile.updatedAt,
               weeklyGoal: serverProfile.weeklyGoal,
+              ...mergedCategoryState,
               workouts: mergedWorkouts,
             };
 
@@ -485,7 +790,7 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
               },
             });
 
-            if (hasLocalWorkouts) {
+            if (hasLocalWorkouts || hasLocalCategoryEdits) {
               await syncProfileWithApi(hydratedProfile);
             }
             return;
@@ -534,11 +839,34 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
           ? oldProfile.workouts
           : mergeWorkouts(existingTarget?.workouts ?? {}, oldProfile.workouts);
 
+      const mergedCategoryState =
+        oldKey === newKey || !existingTarget
+          ? {
+              categories: oldProfile.categories.map((item) => ({ ...item })),
+              archivedCategories: sanitizeArchivedCategories(
+                oldProfile.archivedCategories,
+                oldProfile.categories
+              ),
+              ...(oldProfile.categoriesUpdatedAt
+                ? { categoriesUpdatedAt: oldProfile.categoriesUpdatedAt }
+                : {}),
+            }
+          : mergeCategoryState(existingTarget, oldProfile, true);
+
       const renamedProfile: UserProfileData = {
         nickname: trimmed,
-        createdAt: oldProfile.createdAt,
+        createdAt:
+          oldKey === newKey || !existingTarget
+            ? oldProfile.createdAt
+            : compareIsoTimestamps(
+                  oldProfile.createdAt,
+                  existingTarget.createdAt
+                ) <= 0
+              ? oldProfile.createdAt
+              : existingTarget.createdAt,
         updatedAt: nowIso,
         weeklyGoal: oldProfile.weeklyGoal,
+        ...mergedCategoryState,
         workouts: mergedWorkouts,
       };
 
@@ -644,6 +972,286 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
     [commitStore, syncProfileWithApi]
   );
 
+  const addWorkoutCategory = useCallback(
+    async (
+      label: string
+    ): Promise<{
+      ok: boolean;
+      message?: string;
+      category?: WorkoutCategoryMeta;
+    }> => {
+      const trimmed =
+        typeof label === "string" ? label.trim().slice(0, 24).trim() : "";
+      if (!trimmed) {
+        return { ok: false, message: "운동 이름을 입력해 주세요." };
+      }
+
+      const currentStore = storeRef.current;
+      if (!currentStore.activeNickname) {
+        return { ok: false, message: "로그인이 필요해요." };
+      }
+
+      const key = normalizeNicknameKey(currentStore.activeNickname);
+      const currentProfile = currentStore.profiles[key];
+      if (!currentProfile) {
+        return { ok: false, message: "로그인이 필요해요." };
+      }
+
+      const lowerLabel = trimmed.toLowerCase();
+      const duplicateActive = currentProfile.categories.some(
+        (item) => item.label.trim().toLowerCase() === lowerLabel
+      );
+      if (duplicateActive) {
+        return { ok: false, message: "이미 등록된 운동 종류예요." };
+      }
+
+      const activeIds = new Set(
+        currentProfile.categories.map((item) => item.id)
+      );
+
+      const defaultMatch = DEFAULT_WORKOUT_CATEGORIES.find(
+        (item) =>
+          item.label.trim().toLowerCase() === lowerLabel &&
+          !activeIds.has(item.id)
+      );
+
+      const archivedMatch = !defaultMatch
+        ? Object.values(currentProfile.archivedCategories ?? {}).find(
+            (item) =>
+              item.label.trim().toLowerCase() === lowerLabel &&
+              !activeIds.has(item.id)
+          )
+        : undefined;
+
+      let newCategory: WorkoutCategoryMeta;
+      if (defaultMatch) {
+        newCategory = {
+          id: defaultMatch.id,
+          label: trimmed,
+          emoji: defaultMatch.emoji,
+        };
+      } else if (archivedMatch) {
+        newCategory = {
+          id: archivedMatch.id,
+          label: trimmed,
+          emoji:
+            archivedMatch.emoji ||
+            matchWorkoutEmoji(trimmed, currentProfile.categories),
+        };
+      } else {
+        const allKnownIds = new Set<string>(activeIds);
+        for (const id of Object.keys(currentProfile.archivedCategories ?? {})) {
+          allKnownIds.add(id);
+        }
+        for (const def of DEFAULT_WORKOUT_CATEGORIES) {
+          allKnownIds.add(def.id);
+        }
+        const id = createCustomCategoryId(trimmed, allKnownIds);
+        const emoji = matchWorkoutEmoji(trimmed, currentProfile.categories);
+        newCategory = { id, label: trimmed, emoji };
+      }
+
+      const nowIso = new Date().toISOString();
+      const nextCategories = [...currentProfile.categories, newCategory];
+      const nextArchived: Record<string, WorkoutCategoryMeta> = {
+        ...(currentProfile.archivedCategories ?? {}),
+      };
+      for (const cat of currentProfile.categories) {
+        nextArchived[cat.id] = { ...cat };
+      }
+      nextArchived[newCategory.id] = { ...newCategory };
+
+      const updatedProfile: UserProfileData = {
+        ...currentProfile,
+        categories: nextCategories,
+        archivedCategories: nextArchived,
+        categoriesUpdatedAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      commitStore({
+        activeNickname: currentStore.activeNickname,
+        profiles: {
+          ...currentStore.profiles,
+          [key]: updatedProfile,
+        },
+      });
+
+      await syncProfileWithApi(updatedProfile);
+      return { ok: true, category: newCategory };
+    },
+    [commitStore, syncProfileWithApi]
+  );
+
+  const removeWorkoutCategory = useCallback(
+    async (categoryId: WorkoutCategory): Promise<void> => {
+      const cleanId = sanitizeCategoryId(categoryId);
+      if (!cleanId) {
+        return;
+      }
+
+      const currentStore = storeRef.current;
+      if (!currentStore.activeNickname) {
+        return;
+      }
+
+      const key = normalizeNicknameKey(currentStore.activeNickname);
+      const currentProfile = currentStore.profiles[key];
+      if (!currentProfile) {
+        return;
+      }
+
+      const exists = currentProfile.categories.some(
+        (item) => item.id === cleanId
+      );
+      if (!exists) {
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const nextArchived: Record<string, WorkoutCategoryMeta> = {
+        ...(currentProfile.archivedCategories ?? {}),
+      };
+      for (const cat of currentProfile.categories) {
+        nextArchived[cat.id] = { ...cat };
+      }
+
+      const nextCategories = currentProfile.categories.filter(
+        (item) => item.id !== cleanId
+      );
+
+      const updatedProfile: UserProfileData = {
+        ...currentProfile,
+        categories: nextCategories,
+        archivedCategories: nextArchived,
+        categoriesUpdatedAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      commitStore({
+        activeNickname: currentStore.activeNickname,
+        profiles: {
+          ...currentStore.profiles,
+          [key]: updatedProfile,
+        },
+      });
+
+      await syncProfileWithApi(updatedProfile);
+    },
+    [commitStore, syncProfileWithApi]
+  );
+
+  const moveWorkoutCategory = useCallback(
+    async (
+      categoryId: WorkoutCategory,
+      direction: "up" | "down"
+    ): Promise<void> => {
+      const cleanId = sanitizeCategoryId(categoryId);
+      if (!cleanId) {
+        return;
+      }
+
+      const currentStore = storeRef.current;
+      if (!currentStore.activeNickname) {
+        return;
+      }
+
+      const key = normalizeNicknameKey(currentStore.activeNickname);
+      const currentProfile = currentStore.profiles[key];
+      if (!currentProfile) {
+        return;
+      }
+
+      const index = currentProfile.categories.findIndex(
+        (item) => item.id === cleanId
+      );
+      if (index === -1) {
+        return;
+      }
+
+      const targetIndex = direction === "up" ? index - 1 : index + 1;
+      if (targetIndex < 0 || targetIndex >= currentProfile.categories.length) {
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const nextCategories = currentProfile.categories.map((item) => ({
+        ...item,
+      }));
+      const [moved] = nextCategories.splice(index, 1);
+      nextCategories.splice(targetIndex, 0, moved);
+
+      const nextArchived: Record<string, WorkoutCategoryMeta> = {
+        ...(currentProfile.archivedCategories ?? {}),
+      };
+      for (const cat of nextCategories) {
+        nextArchived[cat.id] = { ...cat };
+      }
+
+      const updatedProfile: UserProfileData = {
+        ...currentProfile,
+        categories: nextCategories,
+        archivedCategories: nextArchived,
+        categoriesUpdatedAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      commitStore({
+        activeNickname: currentStore.activeNickname,
+        profiles: {
+          ...currentStore.profiles,
+          [key]: updatedProfile,
+        },
+      });
+
+      await syncProfileWithApi(updatedProfile);
+    },
+    [commitStore, syncProfileWithApi]
+  );
+
+  const resetWorkoutCategories = useCallback(async (): Promise<void> => {
+    const currentStore = storeRef.current;
+    if (!currentStore.activeNickname) {
+      return;
+    }
+
+    const key = normalizeNicknameKey(currentStore.activeNickname);
+    const currentProfile = currentStore.profiles[key];
+    if (!currentProfile) {
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const nextCategories = cloneDefaultCategories();
+    const nextArchived: Record<string, WorkoutCategoryMeta> = {
+      ...(currentProfile.archivedCategories ?? {}),
+    };
+    for (const cat of currentProfile.categories) {
+      nextArchived[cat.id] = { ...cat };
+    }
+    for (const cat of nextCategories) {
+      nextArchived[cat.id] = { ...cat };
+    }
+
+    const updatedProfile: UserProfileData = {
+      ...currentProfile,
+      categories: nextCategories,
+      archivedCategories: nextArchived,
+      categoriesUpdatedAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    commitStore({
+      activeNickname: currentStore.activeNickname,
+      profiles: {
+        ...currentStore.profiles,
+        [key]: updatedProfile,
+      },
+    });
+
+    await syncProfileWithApi(updatedProfile);
+  }, [commitStore, syncProfileWithApi]);
+
   const toggleWorkoutDay = useCallback(
     async (dateKey: string): Promise<boolean> => {
       if (isFutureDateKey(dateKey)) {
@@ -663,8 +1271,18 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
 
       const nowIso = new Date().toISOString();
       const existingEntry = currentProfile.workouts[dateKey];
+      const existingCategoryIds = getEntryCategoryIds(existingEntry);
       const nextEntry: WorkoutEntry = {
-        ...existingEntry,
+        ...(existingEntry?.durationMinutes !== undefined
+          ? { durationMinutes: existingEntry.durationMinutes }
+          : {}),
+        ...(existingEntry?.note ? { note: existingEntry.note } : {}),
+        ...(existingCategoryIds.length > 0
+          ? {
+              categories: existingCategoryIds,
+              category: existingCategoryIds[0],
+            }
+          : {}),
         date: dateKey,
         completed: !existingEntry?.completed,
         updatedAt: nowIso,
@@ -694,15 +1312,7 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
   );
 
   const saveWorkoutDetail = useCallback(
-    async (
-      dateKey: string,
-      detail: {
-        completed: boolean;
-        category?: WorkoutCategory;
-        durationMinutes?: number;
-        note?: string;
-      }
-    ): Promise<void> => {
+    async (dateKey: string, detail: SaveWorkoutDetailInput): Promise<void> => {
       if (detail.completed && isFutureDateKey(dateKey)) {
         return;
       }
@@ -719,12 +1329,16 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       }
 
       const nowIso = new Date().toISOString();
+      const categories = sanitizeEntryCategories(
+        detail.categories,
+        detail.category
+      );
       const trimmedNote = detail.note?.trim();
       const nextEntry: WorkoutEntry = {
         date: dateKey,
         completed: Boolean(detail.completed),
-        ...(detail.category && VALID_CATEGORIES.has(detail.category)
-          ? { category: detail.category }
+        ...(categories.length > 0
+          ? { categories, category: categories[0] }
           : {}),
         ...(typeof detail.durationMinutes === "number" &&
         Number.isFinite(detail.durationMinutes) &&
@@ -827,11 +1441,24 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
           };
         }
 
+        const mergedCategoryState = existing
+          ? mergeCategoryState(existing, clean, true)
+          : {
+              categories: clean.categories,
+              archivedCategories:
+                clean.archivedCategories ??
+                sanitizeArchivedCategories(undefined, clean.categories),
+              ...(clean.categoriesUpdatedAt
+                ? { categoriesUpdatedAt: clean.categoriesUpdatedAt }
+                : {}),
+            };
+
         nextProfiles[key] = {
           nickname: clean.nickname,
           createdAt: existing?.createdAt ?? clean.createdAt,
           updatedAt: nowIso,
           weeklyGoal: clean.weeklyGoal,
+          ...mergedCategoryState,
           workouts: {
             ...(existing?.workouts ?? {}),
             ...stampedWorkouts,
@@ -972,6 +1599,10 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
     logoutNickname,
     renameActiveNickname,
     setWeeklyGoal,
+    addWorkoutCategory,
+    removeWorkoutCategory,
+    moveWorkoutCategory,
+    resetWorkoutCategories,
     toggleWorkoutDay,
     saveWorkoutDetail,
     exportBackupJson,

@@ -3,9 +3,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   WorkoutCategory,
+  WorkoutCategoryMeta,
   WorkoutEntry,
   UserProfileData,
-  WORKOUT_CATEGORIES,
+  getEntryCategoryIds,
+  resolveCategoryMeta,
 } from "@/lib/workout-types";
 import {
   getTodayKey,
@@ -24,12 +26,14 @@ export interface CalendarBoardProps {
     dateKey: string,
     detail: {
       completed: boolean;
+      categories?: WorkoutCategory[];
       category?: WorkoutCategory;
       durationMinutes?: number;
       note?: string;
     }
   ) => Promise<void> | void;
   onOpenProfileTab?: () => void;
+  onOpenSettingsTab?: () => void;
 }
 
 interface StampSnackbarState {
@@ -307,6 +311,7 @@ export default function CalendarBoard({
   onToggleDay,
   onSaveDetail,
   onOpenProfileTab,
+  onOpenSettingsTab,
 }: CalendarBoardProps): JSX.Element {
   const [todayKey, setTodayKey] = useState<string>(() => getTodayKey());
 
@@ -377,6 +382,15 @@ export default function CalendarBoard({
     }, 2800);
   }, [clearToastTimer]);
 
+  const resolveEntryMetas = useCallback(
+    (entry?: WorkoutEntry | null): WorkoutCategoryMeta[] => {
+      return getEntryCategoryIds(entry)
+        .map((id) => resolveCategoryMeta(id, profile))
+        .filter((meta): meta is WorkoutCategoryMeta => Boolean(meta));
+    },
+    [profile]
+  );
+
   const daysInMonth = useMemo(
     () => getDaysInMonth(viewYear, viewMonth0),
     [viewYear, viewMonth0]
@@ -403,21 +417,10 @@ export default function CalendarBoard({
   const todayEntry: WorkoutEntry | undefined = profile.workouts[todayKey];
   const isTodayCompleted = Boolean(todayEntry?.completed);
 
-  const todayCategoryMeta = useMemo(
-    () =>
-      todayEntry?.category
-        ? WORKOUT_CATEGORIES.find((c) => c.id === todayEntry.category)
-        : undefined,
-    [todayEntry?.category]
+  const todayCategoryMetas = useMemo(
+    () => resolveEntryMetas(todayEntry),
+    [resolveEntryMetas, todayEntry]
   );
-
-  const categoryMap = useMemo(() => {
-    const map = new Map<WorkoutCategory, (typeof WORKOUT_CATEGORIES)[number]>();
-    for (const item of WORKOUT_CATEGORIES) {
-      map.set(item.id, item);
-    }
-    return map;
-  }, []);
 
   const handlePrevMonth = () => {
     if (viewMonth0 === 0) {
@@ -490,16 +493,18 @@ export default function CalendarBoard({
     setDetailDateKey(dateKey);
   };
 
-  // Current month workout notes / category mini-feed (most recent 3-5 entries)
+  // Current month workout notes / category mini-feed (most recent up to 5 entries)
   const monthMemoEntries = useMemo(() => {
-    const prefix = `${viewYear}-${String(viewMonth0 + 1).padStart(2, "0")}-`;
+    const prefix = `${String(viewYear).padStart(4, "0")}-${String(
+      viewMonth0 + 1
+    ).padStart(2, "0")}-`;
     return Object.values(profile.workouts)
       .filter(
         (entry) =>
           entry.completed &&
           entry.date.startsWith(prefix) &&
           Boolean(
-            entry.category ||
+            getEntryCategoryIds(entry).length > 0 ||
               (entry.note && entry.note.trim().length > 0) ||
               entry.durationMinutes
           )
@@ -626,16 +631,19 @@ export default function CalendarBoard({
             오늘 운동 완료! 멋져요 👏
           </p>
 
-          {(todayCategoryMeta ||
-            todayEntry?.durationMinutes ||
-            todayEntry?.note) ? (
+          {todayCategoryMetas.length > 0 ||
+          todayEntry?.durationMinutes ||
+          todayEntry?.note ? (
             <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-              {todayCategoryMeta && (
-                <span className="inline-flex items-center gap-1 rounded-full bg-white/85 px-2.5 py-1 text-xs font-semibold text-[#3C4A2B]">
-                  <span>{todayCategoryMeta.emoji}</span>
-                  <span>{todayCategoryMeta.label}</span>
+              {todayCategoryMetas.map((meta) => (
+                <span
+                  key={meta.id}
+                  className="inline-flex items-center gap-1 rounded-full bg-white/85 px-2.5 py-1 text-xs font-semibold text-[#3C4A2B]"
+                >
+                  <span>{meta.emoji}</span>
+                  <span>{meta.label}</span>
                 </span>
-              )}
+              ))}
               {todayEntry?.durationMinutes && (
                 <span className="inline-flex items-center rounded-full bg-white/85 px-2.5 py-1 text-xs font-semibold text-[#3C4A2B]">
                   ⏱ {todayEntry.durationMinutes}분
@@ -706,9 +714,7 @@ export default function CalendarBoard({
               const isFuture = isFutureDateKey(dateKey, todayKey);
               const isToday = dateKey === todayKey;
               const isCompleted = !isFuture && Boolean(entry?.completed);
-              const catMeta = entry?.category
-                ? categoryMap.get(entry.category)
-                : undefined;
+              const entryMetas = isCompleted ? resolveEntryMetas(entry) : [];
               const hasNote = Boolean(entry?.note && entry.note.trim().length > 0);
 
               return (
@@ -762,11 +768,18 @@ export default function CalendarBoard({
                           </svg>
                         </span>
 
-                        {(catMeta || hasNote) && (
-                          <span className="absolute bottom-1 right-1 z-10 inline-flex items-center gap-0.5 rounded-md bg-white/90 px-1 py-0.5 text-[9px] leading-none shadow-sm">
-                            {catMeta && <span>{catMeta.emoji}</span>}
+                        {(entryMetas.length > 0 || hasNote) && (
+                          <span className="absolute bottom-1 right-1 z-10 inline-flex max-w-[calc(100%-0.5rem)] items-center gap-0.5 rounded-md bg-white/90 px-1 py-0.5 text-[9px] leading-none shadow-sm">
+                            {entryMetas.slice(0, 2).map((meta) => (
+                              <span key={meta.id}>{meta.emoji}</span>
+                            ))}
+                            {entryMetas.length > 2 && (
+                              <span className="text-[8px] font-bold text-[#4B7A15]">
+                                +{entryMetas.length - 2}
+                              </span>
+                            )}
                             {hasNote && (
-                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#5B8E1D]" />
+                              <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-[#5B8E1D]" />
                             )}
                           </span>
                         )}
@@ -852,9 +865,7 @@ export default function CalendarBoard({
           <div className="divide-y divide-[#F1ECE2]">
             {monthMemoEntries.map((item) => {
               const parts = parseDateKeyParts(item.date);
-              const cat = item.category
-                ? categoryMap.get(item.category)
-                : undefined;
+              const cats = resolveEntryMetas(item);
 
               return (
                 <button
@@ -871,9 +882,9 @@ export default function CalendarBoard({
                       <span className="text-xs font-semibold text-[#5C554B]">
                         {parts.month}월 {parts.day}일
                       </span>
-                      {cat && (
+                      {cats.length > 0 && (
                         <span className="text-xs font-medium text-[#3F3A34]">
-                          · {cat.emoji} {cat.label}
+                          · {cats.map((c) => `${c.emoji} ${c.label}`).join(", ")}
                         </span>
                       )}
                       {item.durationMinutes && (
@@ -940,9 +951,12 @@ export default function CalendarBoard({
         isOpen={detailDateKey !== null}
         dateKey={detailDateKey}
         entry={activeSheetEntry}
+        categories={profile.categories}
+        archivedCategories={profile.archivedCategories}
         isToday={detailDateKey === todayKey}
         onClose={() => setDetailDateKey(null)}
         onSave={onSaveDetail}
+        onOpenSettingsTab={onOpenSettingsTab}
       />
     </div>
   );

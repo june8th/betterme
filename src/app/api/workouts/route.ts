@@ -1,10 +1,12 @@
 import fs from "fs";
 import path from "path";
 import { NextRequest, NextResponse } from "next/server";
+import { matchWorkoutEmoji } from "@/lib/emoji-matcher";
 import {
+  DEFAULT_WORKOUT_CATEGORIES,
   UserProfileData,
-  WORKOUT_CATEGORIES,
   WorkoutCategory,
+  WorkoutCategoryMeta,
   WorkoutEntry,
 } from "@/lib/workout-types";
 
@@ -31,9 +33,31 @@ const globalStoreHolder = globalThis as GlobalWithBettermeStore;
 const PRIMARY_DATA_FILE = path.join(process.cwd(), "data", "workouts.json");
 const TMP_DATA_FILE = "/tmp/betterme-workouts.json";
 
-const VALID_CATEGORIES = new Set<WorkoutCategory>(
-  WORKOUT_CATEGORIES.map((item) => item.id)
-);
+function cloneDefaultCategories(): WorkoutCategoryMeta[] {
+  return DEFAULT_WORKOUT_CATEGORIES.map((item) => ({ ...item }));
+}
+
+function buildDefaultArchivedCategories(): Record<string, WorkoutCategoryMeta> {
+  const map: Record<string, WorkoutCategoryMeta> = {};
+  for (const item of DEFAULT_WORKOUT_CATEGORIES) {
+    map[item.id] = { ...item };
+  }
+  return map;
+}
+
+function areDefaultCategories(categories: WorkoutCategoryMeta[]): boolean {
+  if (categories.length !== DEFAULT_WORKOUT_CATEGORIES.length) {
+    return false;
+  }
+  for (let i = 0; i < DEFAULT_WORKOUT_CATEGORIES.length; i += 1) {
+    const a = categories[i];
+    const b = DEFAULT_WORKOUT_CATEGORIES[i];
+    if (a.id !== b.id || a.label !== b.label || a.emoji !== b.emoji) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function normalizeNicknameKey(nickname: string): string {
   return nickname.trim().toLowerCase();
@@ -46,6 +70,92 @@ function compareIsoTimestamps(a?: string, b?: string): number {
     return parsedA - parsedB;
   }
   return String(a ?? "").localeCompare(String(b ?? ""));
+}
+
+function sanitizeCategoryId(raw: unknown): WorkoutCategory | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const trimmed = raw.trim().slice(0, 64).trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function sanitizeCategoryMeta(
+  raw: unknown,
+  fallbackId?: string
+): WorkoutCategoryMeta | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const candidate = raw as Partial<WorkoutCategoryMeta>;
+  const id = sanitizeCategoryId(candidate.id ?? fallbackId);
+  const label =
+    typeof candidate.label === "string"
+      ? candidate.label.trim().slice(0, 40).trim()
+      : "";
+  if (!id || !label) {
+    return null;
+  }
+  const rawEmoji =
+    typeof candidate.emoji === "string" ? candidate.emoji.trim() : "";
+  const emoji = rawEmoji || matchWorkoutEmoji(label);
+  return { id, label, emoji };
+}
+
+function sanitizeEntryCategories(
+  rawCategories: unknown,
+  rawCategory: unknown
+): WorkoutCategory[] {
+  if (Array.isArray(rawCategories)) {
+    if (rawCategories.length === 0) {
+      return [];
+    }
+    const seen = new Set<string>();
+    const result: WorkoutCategory[] = [];
+    for (const item of rawCategories) {
+      const cleanId = sanitizeCategoryId(item);
+      if (cleanId && !seen.has(cleanId)) {
+        seen.add(cleanId);
+        result.push(cleanId);
+      }
+    }
+    if (result.length > 0) {
+      return result;
+    }
+    const fallbackSingle = sanitizeCategoryId(rawCategory);
+    return fallbackSingle ? [fallbackSingle] : [];
+  }
+
+  const single = sanitizeCategoryId(rawCategory);
+  return single ? [single] : [];
+}
+
+function sanitizeArchivedCategories(
+  rawArchived: unknown,
+  activeCategories: WorkoutCategoryMeta[]
+): Record<string, WorkoutCategoryMeta> {
+  const archived: Record<string, WorkoutCategoryMeta> = {};
+
+  if (
+    rawArchived &&
+    typeof rawArchived === "object" &&
+    !Array.isArray(rawArchived)
+  ) {
+    for (const [key, value] of Object.entries(
+      rawArchived as Record<string, unknown>
+    )) {
+      const cleanMeta = sanitizeCategoryMeta(value, key);
+      if (cleanMeta) {
+        archived[cleanMeta.id] = cleanMeta;
+      }
+    }
+  }
+
+  for (const cat of activeCategories) {
+    archived[cat.id] = { ...cat };
+  }
+
+  return archived;
 }
 
 function sanitizeWorkoutEntry(
@@ -64,11 +174,7 @@ function sanitizeWorkoutEntry(
     return null;
   }
 
-  const category =
-    typeof raw.category === "string" &&
-    VALID_CATEGORIES.has(raw.category as WorkoutCategory)
-      ? (raw.category as WorkoutCategory)
-      : undefined;
+  const categories = sanitizeEntryCategories(raw.categories, raw.category);
 
   const durationMinutes =
     typeof raw.durationMinutes === "number" &&
@@ -90,7 +196,9 @@ function sanitizeWorkoutEntry(
   return {
     date: resolvedDate,
     completed: Boolean(raw.completed),
-    ...(category ? { category } : {}),
+    ...(categories.length > 0
+      ? { categories, category: categories[0] }
+      : {}),
     ...(durationMinutes !== undefined ? { durationMinutes } : {}),
     ...(note ? { note } : {}),
     updatedAt,
@@ -122,6 +230,9 @@ interface RawProfileInput {
   createdAt?: string;
   updatedAt?: string;
   weeklyGoal?: number;
+  categories?: unknown[];
+  archivedCategories?: Record<string, unknown>;
+  categoriesUpdatedAt?: string;
   workouts?: Record<string, Partial<WorkoutEntry>>;
 }
 
@@ -153,11 +264,47 @@ function sanitizeProfile(
       ? Math.round(raw.weeklyGoal)
       : 4;
 
+  const hasCategoriesArray = Array.isArray(raw.categories);
+  let categories: WorkoutCategoryMeta[];
+  if (hasCategoriesArray) {
+    const seenIds = new Set<string>();
+    categories = [];
+    for (const rawItem of raw.categories as unknown[]) {
+      const cleanMeta = sanitizeCategoryMeta(rawItem);
+      if (cleanMeta && !seenIds.has(cleanMeta.id)) {
+        seenIds.add(cleanMeta.id);
+        categories.push(cleanMeta);
+      }
+    }
+  } else {
+    categories = cloneDefaultCategories();
+  }
+
+  const archivedCategories = sanitizeArchivedCategories(
+    raw.archivedCategories,
+    categories
+  );
+
+  const explicitCategoriesUpdatedAt =
+    typeof raw.categoriesUpdatedAt === "string" &&
+    raw.categoriesUpdatedAt.trim().length > 0
+      ? raw.categoriesUpdatedAt.trim()
+      : undefined;
+
+  const categoriesUpdatedAt =
+    explicitCategoriesUpdatedAt ??
+    (hasCategoriesArray && !areDefaultCategories(categories)
+      ? updatedAt
+      : undefined);
+
   return {
     nickname,
     createdAt,
     updatedAt,
     weeklyGoal,
+    categories,
+    archivedCategories,
+    ...(categoriesUpdatedAt ? { categoriesUpdatedAt } : {}),
     workouts: sanitizeWorkoutsMap(raw.workouts, updatedAt),
   };
 }
@@ -181,6 +328,76 @@ function mergeWorkouts(
   return merged;
 }
 
+function mergeCategoryState(
+  baseProfile: Pick<
+    UserProfileData,
+    "categories" | "archivedCategories" | "categoriesUpdatedAt"
+  >,
+  incomingProfile: Pick<
+    UserProfileData,
+    "categories" | "archivedCategories" | "categoriesUpdatedAt"
+  >,
+  incomingIsNewer: boolean
+): {
+  categories: WorkoutCategoryMeta[];
+  archivedCategories: Record<string, WorkoutCategoryMeta>;
+  categoriesUpdatedAt?: string;
+} {
+  const baseCatTs = baseProfile.categoriesUpdatedAt;
+  const incomingCatTs = incomingProfile.categoriesUpdatedAt;
+
+  let pickIncomingCategories: boolean;
+  let categoriesUpdatedAt: string | undefined;
+
+  if (baseCatTs && incomingCatTs) {
+    pickIncomingCategories = compareIsoTimestamps(incomingCatTs, baseCatTs) >= 0;
+    categoriesUpdatedAt = pickIncomingCategories ? incomingCatTs : baseCatTs;
+  } else if (incomingCatTs && !baseCatTs) {
+    pickIncomingCategories = true;
+    categoriesUpdatedAt = incomingCatTs;
+  } else if (baseCatTs && !incomingCatTs) {
+    pickIncomingCategories = false;
+    categoriesUpdatedAt = baseCatTs;
+  } else {
+    pickIncomingCategories = incomingIsNewer;
+    categoriesUpdatedAt = undefined;
+  }
+
+  const winningCategories = (
+    pickIncomingCategories ? incomingProfile.categories : baseProfile.categories
+  ).map((item) => ({ ...item }));
+
+  const archivedCategories: Record<string, WorkoutCategoryMeta> = {};
+  const olderArchived = pickIncomingCategories
+    ? baseProfile.archivedCategories
+    : incomingProfile.archivedCategories;
+  const newerArchived = pickIncomingCategories
+    ? incomingProfile.archivedCategories
+    : baseProfile.archivedCategories;
+
+  for (const [id, meta] of Object.entries(olderArchived ?? {})) {
+    archivedCategories[id] = { ...meta };
+  }
+  for (const [id, meta] of Object.entries(newerArchived ?? {})) {
+    archivedCategories[id] = { ...meta };
+  }
+  for (const meta of baseProfile.categories) {
+    archivedCategories[meta.id] = { ...meta };
+  }
+  for (const meta of incomingProfile.categories) {
+    archivedCategories[meta.id] = { ...meta };
+  }
+  for (const meta of winningCategories) {
+    archivedCategories[meta.id] = { ...meta };
+  }
+
+  return {
+    categories: winningCategories,
+    archivedCategories,
+    ...(categoriesUpdatedAt ? { categoriesUpdatedAt } : {}),
+  };
+}
+
 function mergeProfiles(
   baseProfile: UserProfileData,
   incomingProfile: UserProfileData,
@@ -194,10 +411,26 @@ function mergeProfiles(
     !hasExplicitUpdatedAt ||
     compareIsoTimestamps(incomingProfile.updatedAt, baseProfile.updatedAt) >= 0;
 
+  const mergedCategoryState = mergeCategoryState(
+    baseProfile,
+    incomingProfile,
+    incomingIsNewer
+  );
+
   let latestUpdatedAt =
     compareIsoTimestamps(incomingProfile.updatedAt, baseProfile.updatedAt) >= 0
       ? incomingProfile.updatedAt
       : baseProfile.updatedAt;
+
+  if (
+    mergedCategoryState.categoriesUpdatedAt &&
+    compareIsoTimestamps(
+      mergedCategoryState.categoriesUpdatedAt,
+      latestUpdatedAt
+    ) > 0
+  ) {
+    latestUpdatedAt = mergedCategoryState.categoriesUpdatedAt;
+  }
 
   for (const entry of Object.values(mergedWorkouts)) {
     if (compareIsoTimestamps(entry.updatedAt, latestUpdatedAt) > 0) {
@@ -217,6 +450,7 @@ function mergeProfiles(
     weeklyGoal: incomingIsNewer
       ? incomingProfile.weeklyGoal
       : baseProfile.weeklyGoal,
+    ...mergedCategoryState,
     workouts: mergedWorkouts,
   };
 }
@@ -230,7 +464,7 @@ function parseStoreJson(rawJson: string): ServerWorkoutsStore | null {
     const nowIso = new Date().toISOString();
     const profiles: Record<string, UserProfileData> = {};
     for (const [, rawProfile] of Object.entries(parsed.profiles)) {
-      const clean = sanitizeProfile(rawProfile, nowIso);
+      const clean = sanitizeProfile(rawProfile as RawProfileInput, nowIso);
       if (clean) {
         const key = normalizeNicknameKey(clean.nickname);
         const existing = profiles[key];
@@ -415,11 +649,23 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     let mergedProfile: UserProfileData;
     if (oldKey === newKey) {
+      const categories = oldProfile
+        ? oldProfile.categories.map((item) => ({ ...item }))
+        : cloneDefaultCategories();
+      const archivedCategories = oldProfile
+        ? sanitizeArchivedCategories(oldProfile.archivedCategories, categories)
+        : buildDefaultArchivedCategories();
+
       mergedProfile = {
         nickname: newTrimmed,
         createdAt: oldProfile?.createdAt ?? nowIso,
         updatedAt: nowIso,
         weeklyGoal: oldProfile?.weeklyGoal ?? 4,
+        categories,
+        archivedCategories,
+        ...(oldProfile?.categoriesUpdatedAt
+          ? { categoriesUpdatedAt: oldProfile.categoriesUpdatedAt }
+          : {}),
         workouts: oldProfile?.workouts ?? {},
       };
       store.profiles[newKey] = mergedProfile;
@@ -430,16 +676,57 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
       const earliestCreatedAt =
         oldProfile && targetProfile
-          ? compareIsoTimestamps(oldProfile.createdAt, targetProfile.createdAt) <= 0
+          ? compareIsoTimestamps(
+                oldProfile.createdAt,
+                targetProfile.createdAt
+              ) <= 0
             ? oldProfile.createdAt
             : targetProfile.createdAt
           : (oldProfile?.createdAt ?? targetProfile?.createdAt ?? nowIso);
+
+      let categoryState: {
+        categories: WorkoutCategoryMeta[];
+        archivedCategories: Record<string, WorkoutCategoryMeta>;
+        categoriesUpdatedAt?: string;
+      };
+
+      if (targetProfile && oldProfile) {
+        categoryState = mergeCategoryState(targetProfile, oldProfile, true);
+      } else if (oldProfile) {
+        categoryState = {
+          categories: oldProfile.categories.map((item) => ({ ...item })),
+          archivedCategories: sanitizeArchivedCategories(
+            oldProfile.archivedCategories,
+            oldProfile.categories
+          ),
+          ...(oldProfile.categoriesUpdatedAt
+            ? { categoriesUpdatedAt: oldProfile.categoriesUpdatedAt }
+            : {}),
+        };
+      } else if (targetProfile) {
+        categoryState = {
+          categories: targetProfile.categories.map((item) => ({ ...item })),
+          archivedCategories: sanitizeArchivedCategories(
+            targetProfile.archivedCategories,
+            targetProfile.categories
+          ),
+          ...(targetProfile.categoriesUpdatedAt
+            ? { categoriesUpdatedAt: targetProfile.categoriesUpdatedAt }
+            : {}),
+        };
+      } else {
+        categoryState = {
+          categories: cloneDefaultCategories(),
+          archivedCategories: buildDefaultArchivedCategories(),
+        };
+      }
 
       mergedProfile = {
         nickname: newTrimmed,
         createdAt: earliestCreatedAt,
         updatedAt: nowIso,
         weeklyGoal: oldProfile?.weeklyGoal ?? targetProfile?.weeklyGoal ?? 4,
+        ...categoryState,
         workouts: combinedWorkouts,
       };
       store.profiles[newKey] = mergedProfile;

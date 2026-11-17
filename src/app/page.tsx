@@ -5,8 +5,9 @@ import { useWorkoutStore } from "@/lib/workout-store";
 import CalendarBoard from "@/components/CalendarBoard";
 import OnboardingView from "@/components/OnboardingView";
 import ProfileView from "@/components/ProfileView";
+import SettingsView from "@/components/SettingsView";
 
-type AppTab = "calendar" | "profile";
+type AppTab = "calendar" | "profile" | "settings";
 
 export default function HomePage() {
   const {
@@ -19,6 +20,10 @@ export default function HomePage() {
     logoutNickname,
     renameActiveNickname,
     setWeeklyGoal,
+    addWorkoutCategory,
+    removeWorkoutCategory,
+    moveWorkoutCategory,
+    resetWorkoutCategories,
     toggleWorkoutDay,
     saveWorkoutDetail,
     exportBackupJson,
@@ -126,8 +131,9 @@ export default function HomePage() {
             onToggleDay={toggleWorkoutDay}
             onSaveDetail={saveWorkoutDetail}
             onOpenProfileTab={() => setActiveTab("profile")}
+            onOpenSettingsTab={() => setActiveTab("settings")}
           />
-        ) : (
+        ) : activeTab === "profile" ? (
           <ProfileView
             profile={profile}
             savedNicknames={savedNicknames}
@@ -135,6 +141,15 @@ export default function HomePage() {
             onSwitchNickname={loginWithNickname}
             onRenameNickname={renameActiveNickname}
             onLogout={logoutNickname}
+          />
+        ) : (
+          <SettingsView
+            profile={profile}
+            syncing={syncing}
+            onAddCategory={addWorkoutCategory}
+            onRemoveCategory={removeWorkoutCategory}
+            onMoveCategory={moveWorkoutCategory}
+            onResetCategories={resetWorkoutCategories}
             onChangeWeeklyGoal={setWeeklyGoal}
             onExportBackup={exportBackupJson}
             onImportBackup={importBackupJson}
@@ -142,12 +157,12 @@ export default function HomePage() {
         )}
       </main>
 
-      {/* Fixed iOS Bottom 2-Tab Navigation Bar */}
+      {/* Fixed iOS Bottom 3-Tab Navigation Bar */}
       <nav
         aria-label="하단 탭 내비게이션"
         className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-[430px] z-30 bg-white/90 backdrop-blur-md border-t border-[#EAE3D5] pb-safe"
       >
-        <div className="grid grid-cols-2 px-4 pt-2 pb-1">
+        <div className="grid grid-cols-3 px-3 pt-2 pb-1">
           <button
             type="button"
             onClick={() => setActiveTab("calendar")}
@@ -235,6 +250,46 @@ export default function HomePage() {
               </svg>
             </span>
             <span className="text-[11px] font-bold tracking-tight">프로필</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab("settings")}
+            aria-current={activeTab === "settings" ? "page" : undefined}
+            className={`flex flex-col items-center justify-center gap-1 py-1 rounded-2xl transition ${
+              activeTab === "settings"
+                ? "text-[#6CA824]"
+                : "text-[#8C8479] hover:text-[#5B554C]"
+            }`}
+          >
+            <span
+              className={`px-3.5 py-1 rounded-full transition ${
+                activeTab === "settings" ? "bg-[#6CA824]/12" : ""
+              }`}
+            >
+              <svg
+                className="w-5 h-5"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden="true"
+              >
+                <circle
+                  cx="12"
+                  cy="12"
+                  r="3.25"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                />
+                <path
+                  d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </span>
+            <span className="text-[11px] font-bold tracking-tight">설정</span>
           </button>
         </div>
       </nav>

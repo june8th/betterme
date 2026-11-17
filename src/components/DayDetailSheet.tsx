@@ -1,14 +1,17 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   WorkoutCategory,
+  WorkoutCategoryMeta,
   WorkoutEntry,
-  WORKOUT_CATEGORIES,
+  getEntryCategoryIds,
+  resolveCategoryMeta,
 } from "@/lib/workout-types";
 
 export interface DayDetailPayload {
   completed: boolean;
+  categories?: WorkoutCategory[];
   category?: WorkoutCategory;
   durationMinutes?: number;
   note?: string;
@@ -18,9 +21,12 @@ export interface DayDetailSheetProps {
   isOpen: boolean;
   dateKey: string | null;
   entry?: WorkoutEntry;
+  categories: WorkoutCategoryMeta[];
+  archivedCategories?: Record<string, WorkoutCategoryMeta>;
   isToday?: boolean;
   onClose: () => void;
   onSave: (dateKey: string, detail: DayDetailPayload) => Promise<void> | void;
+  onOpenSettingsTab?: () => void;
 }
 
 const QUICK_DURATIONS = [15, 30, 45, 60, 90] as const;
@@ -42,13 +48,16 @@ export default function DayDetailSheet({
   isOpen,
   dateKey,
   entry,
+  categories,
+  archivedCategories,
   isToday = false,
   onClose,
   onSave,
+  onOpenSettingsTab,
 }: DayDetailSheetProps): JSX.Element | null {
-  const [selectedCategory, setSelectedCategory] = useState<
-    WorkoutCategory | undefined
-  >(entry?.category);
+  const [selectedCategories, setSelectedCategories] = useState<
+    WorkoutCategory[]
+  >(() => getEntryCategoryIds(entry));
   const [selectedDuration, setSelectedDuration] = useState<number | undefined>(
     entry?.durationMinutes
   );
@@ -57,7 +66,7 @@ export default function DayDetailSheet({
 
   useEffect(() => {
     if (!isOpen) return;
-    setSelectedCategory(entry?.category);
+    setSelectedCategories(getEntryCategoryIds(entry));
     setSelectedDuration(entry?.durationMinutes);
     setNote(entry?.note ?? "");
     setSubmitting(false);
@@ -82,12 +91,47 @@ export default function DayDetailSheet({
     };
   }, [isOpen, onClose]);
 
+  const displayCategories = useMemo(() => {
+    const list: WorkoutCategoryMeta[] = Array.isArray(categories)
+      ? [...categories]
+      : [];
+    const seenIds = new Set<WorkoutCategory>(list.map((cat) => cat.id));
+
+    for (const id of selectedCategories) {
+      if (seenIds.has(id)) continue;
+      const resolved = resolveCategoryMeta(id, {
+        categories: list,
+        archivedCategories,
+      });
+      if (resolved) {
+        list.push(resolved);
+        seenIds.add(id);
+      }
+    }
+
+    return list;
+  }, [categories, archivedCategories, selectedCategories]);
+
   if (!isOpen || !dateKey) {
     return null;
   }
 
   const { month, day } = parseDateKey(dateKey);
   const isCurrentlyCompleted = Boolean(entry?.completed);
+
+  const handleToggleCategory = (categoryId: WorkoutCategory) => {
+    setSelectedCategories((prev) =>
+      prev.includes(categoryId)
+        ? prev.filter((id) => id !== categoryId)
+        : [...prev, categoryId]
+    );
+  };
+
+  const handleJumpToSettings = () => {
+    if (!onOpenSettingsTab) return;
+    onClose();
+    onOpenSettingsTab();
+  };
 
   const handleSaveCompleted = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -98,9 +142,11 @@ export default function DayDetailSheet({
       const trimmedNote = note.trim().slice(0, 60);
       await onSave(dateKey, {
         completed: true,
-        category: selectedCategory,
+        categories:
+          selectedCategories.length > 0 ? selectedCategories : undefined,
+        category: selectedCategories[0],
         durationMinutes: selectedDuration,
-        note: trimmedNote.length > 0 ? trimmedNote : undefined,
+        note: trimmedNote || undefined,
       });
       onClose();
     } finally {
@@ -115,6 +161,7 @@ export default function DayDetailSheet({
     try {
       await onSave(dateKey, {
         completed: false,
+        categories: undefined,
         category: undefined,
         durationMinutes: undefined,
         note: undefined,
@@ -134,7 +181,7 @@ export default function DayDetailSheet({
       aria-labelledby="day-detail-sheet-title"
     >
       <div
-        className="w-full max-w-[430px] rounded-t-[28px] border-t border-[#ECE5D8] bg-[#FAF7F2] px-5 pt-3 pb-[max(1.5rem,env(safe-area-inset-bottom,0px))] shadow-[0_-14px_40px_rgba(35,31,27,0.2)]"
+        className="max-h-[88vh] w-full max-w-[430px] overflow-y-auto rounded-t-[28px] border-t border-[#ECE5D8] bg-[#FAF7F2] px-5 pt-3 pb-[max(1.5rem,env(safe-area-inset-bottom,0px))] shadow-[0_-14px_40px_rgba(35,31,27,0.2)]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Drag Indicator */}
@@ -181,38 +228,74 @@ export default function DayDetailSheet({
         </div>
 
         <form onSubmit={handleSaveCompleted} className="space-y-4">
-          {/* Category Chips */}
+          {/* Category Chips (Multi-Select) */}
           <div>
-            <div className="mb-2 flex items-center justify-between">
-              <span className="text-xs font-bold text-[#4A453E]">
-                운동 종류
-              </span>
-              <span className="text-[11px] text-[#8E867B]">선택 사항</span>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {WORKOUT_CATEGORIES.map((cat) => {
-                const active = selectedCategory === cat.id;
-                return (
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-bold text-[#4A453E]">
+                  운동 종류
+                </span>
+                {selectedCategories.length > 0 && (
+                  <span className="rounded-full bg-[#EAF4DC] px-1.5 py-0.5 text-[10px] font-bold text-[#4E7E16]">
+                    {selectedCategories.length}개 선택
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-[#8E867B]">
+                  복수 선택 가능
+                </span>
+                {onOpenSettingsTab && (
                   <button
-                    key={cat.id}
                     type="button"
-                    onClick={() =>
-                      setSelectedCategory((prev) =>
-                        prev === cat.id ? undefined : cat.id
-                      )
-                    }
-                    className={`inline-flex items-center gap-1.5 rounded-full border px-3.5 py-2 text-xs font-semibold transition active:scale-95 ${
-                      active
-                        ? "border-[#6CA824] bg-[#6CA824] text-white shadow-[0_3px_10px_rgba(108,168,36,0.28)]"
-                        : "border-[#E6DFD2] bg-white text-[#3F3A34] hover:border-[#CFC5B4]"
-                    }`}
+                    onClick={handleJumpToSettings}
+                    className="rounded-full border border-[#E2DACB] bg-white px-2 py-0.5 text-[11px] font-semibold text-[#5B8E1D] transition hover:border-[#C8DCAB] hover:bg-[#F5FAEC] active:scale-95"
                   >
-                    <span>{cat.label}</span>
-                    <span>{cat.emoji}</span>
+                    운동 종류 편집 ›
                   </button>
-                );
-              })}
+                )}
+              </div>
             </div>
+
+            {displayCategories.length === 0 ? (
+              <div className="rounded-2xl border border-dashed border-[#DFD7C8] bg-white/80 px-4 py-3.5 text-center">
+                <p className="text-xs font-medium text-[#6F685E]">
+                  등록된 운동 종류가 없어요. 나만의 운동 항목을 추가해 보세요!
+                </p>
+                {onOpenSettingsTab && (
+                  <button
+                    type="button"
+                    onClick={handleJumpToSettings}
+                    className="mt-2 inline-flex items-center gap-1 rounded-full bg-[#EEF6E2] px-3 py-1.5 text-xs font-bold text-[#4E7E16] transition hover:bg-[#E3F0D0] active:scale-95"
+                  >
+                    <span>설정에서 운동 종류 추가하기 ›</span>
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {displayCategories.map((cat) => {
+                  const active = selectedCategories.includes(cat.id);
+                  return (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => handleToggleCategory(cat.id)}
+                      className={`inline-flex items-center gap-1.5 rounded-full border px-3.5 py-2 text-xs font-semibold transition active:scale-95 ${
+                        active
+                          ? "border-[#6CA824] bg-[#6CA824] text-white shadow-[0_3px_10px_rgba(108,168,36,0.28)]"
+                          : "border-[#E6DFD2] bg-white text-[#3F3A34] hover:border-[#CFC5B4]"
+                      }`}
+                    >
+                      <span>{cat.emoji}</span>
+                      <span>{cat.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Quick Duration Pills */}
