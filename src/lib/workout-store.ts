@@ -1,11 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { isFutureDateKey } from "@/lib/date-utils";
+import {
+  calculateStreaks,
+  getMonthCompletedCount,
+  getTodayKey,
+  isFutureDateKey,
+} from "@/lib/date-utils";
 import { matchWorkoutEmoji } from "@/lib/emoji-matcher";
 import {
   DEFAULT_WORKOUT_CATEGORIES,
   getEntryCategoryIds,
+  LeaderboardEntry,
+  NicknameRenameRecord,
   UserProfileData,
   WorkoutCategory,
   WorkoutCategoryMeta,
@@ -30,9 +37,12 @@ export interface UseWorkoutStoreResult {
     totalCompleted: number;
     updatedAt: string;
   }>;
+  leaderboard: LeaderboardEntry[];
+  refreshLeaderboard: () => Promise<void>;
   loginWithNickname: (nickname: string) => Promise<void>;
   logoutNickname: () => void;
   renameActiveNickname: (newNickname: string) => Promise<boolean>;
+  deleteSavedNickname: (nickname: string) => Promise<boolean>;
   setWeeklyGoal: (goal: number) => Promise<void>;
   addWorkoutCategory: (
     label: string
@@ -63,12 +73,19 @@ interface SavedNicknameItem {
 interface LocalStoreState {
   activeNickname: string | null;
   profiles: Record<string, UserProfileData>;
+  renames?: Record<string, NicknameRenameRecord>;
+  deletedNicknames?: Record<string, string>;
 }
 
 interface WorkoutsApiResponse {
   ok?: boolean;
   profile?: UserProfileData | null;
+  deleted?: boolean;
+  redirectedFrom?: string;
   savedNicknames?: SavedNicknameItem[];
+  leaderboard?: LeaderboardEntry[];
+  renames?: Record<string, NicknameRenameRecord>;
+  deletedNicknames?: Record<string, string>;
 }
 
 const STORAGE_KEY = "betterme_store_v1";
@@ -110,6 +127,19 @@ function compareIsoTimestamps(a?: string, b?: string): number {
     return parsedA - parsedB;
   }
   return String(a ?? "").localeCompare(String(b ?? ""));
+}
+
+function parseDateKeyYearMonth(dateKey: string): {
+  year: number;
+  monthIndex0: number;
+} {
+  const [y, m] = dateKey.split("-").map((part) => parseInt(part, 10));
+  const fallback = new Date();
+  return {
+    year: Number.isFinite(y) ? y : fallback.getFullYear(),
+    monthIndex0:
+      Number.isFinite(m) && m >= 1 && m <= 12 ? m - 1 : fallback.getMonth(),
+  };
 }
 
 function sanitizeCategoryId(raw: unknown): WorkoutCategory | null {
@@ -361,6 +391,156 @@ export function sanitizeProfile(
   };
 }
 
+function sanitizeRenamesMap(
+  rawRenames: unknown
+): Record<string, NicknameRenameRecord> {
+  const sanitized: Record<string, NicknameRenameRecord> = {};
+  if (!rawRenames || typeof rawRenames !== "object" || Array.isArray(rawRenames)) {
+    return sanitized;
+  }
+
+  for (const [rawKey, rawValue] of Object.entries(
+    rawRenames as Record<string, unknown>
+  )) {
+    const oldKey = normalizeNicknameKey(rawKey);
+    if (!oldKey || !rawValue || typeof rawValue !== "object") {
+      continue;
+    }
+    const candidate = rawValue as Partial<NicknameRenameRecord>;
+    const targetNickname =
+      typeof candidate.targetNickname === "string"
+        ? candidate.targetNickname.trim()
+        : "";
+    const renamedAt =
+      typeof candidate.renamedAt === "string"
+        ? candidate.renamedAt.trim()
+        : "";
+    if (!targetNickname || !renamedAt) {
+      continue;
+    }
+    if (normalizeNicknameKey(targetNickname) === oldKey) {
+      continue;
+    }
+    const existing = sanitized[oldKey];
+    if (
+      !existing ||
+      compareIsoTimestamps(renamedAt, existing.renamedAt) >= 0
+    ) {
+      sanitized[oldKey] = { targetNickname, renamedAt };
+    }
+  }
+
+  return sanitized;
+}
+
+function sanitizeDeletedNicknamesMap(rawDeleted: unknown): Record<string, string> {
+  const sanitized: Record<string, string> = {};
+  if (
+    !rawDeleted ||
+    typeof rawDeleted !== "object" ||
+    Array.isArray(rawDeleted)
+  ) {
+    return sanitized;
+  }
+
+  for (const [rawKey, rawValue] of Object.entries(
+    rawDeleted as Record<string, unknown>
+  )) {
+    const key = normalizeNicknameKey(rawKey);
+    const deletedAt = typeof rawValue === "string" ? rawValue.trim() : "";
+    if (!key || !deletedAt) {
+      continue;
+    }
+    const existing = sanitized[key];
+    if (!existing || compareIsoTimestamps(deletedAt, existing) >= 0) {
+      sanitized[key] = deletedAt;
+    }
+  }
+
+  return sanitized;
+}
+
+function resolveRenameChain(
+  startKey: string,
+  renames?: Record<string, NicknameRenameRecord>
+): { targetKey: string; targetNickname: string; renamedAt: string } | null {
+  if (!renames || !startKey) {
+    return null;
+  }
+
+  const visited = new Set<string>([startKey]);
+  let currentKey = startKey;
+  let finalRecord: NicknameRenameRecord | null = null;
+  let latestRenamedAt = "";
+
+  for (let hop = 0; hop < 10; hop += 1) {
+    const rec = renames[currentKey];
+    if (!rec) {
+      break;
+    }
+    const nextKey = normalizeNicknameKey(rec.targetNickname);
+    if (!nextKey || visited.has(nextKey)) {
+      break;
+    }
+    visited.add(nextKey);
+    finalRecord = rec;
+    if (
+      !latestRenamedAt ||
+      compareIsoTimestamps(rec.renamedAt, latestRenamedAt) > 0
+    ) {
+      latestRenamedAt = rec.renamedAt;
+    }
+    currentKey = nextKey;
+  }
+
+  if (!finalRecord || currentKey === startKey) {
+    return null;
+  }
+
+  return {
+    targetKey: currentKey,
+    targetNickname: finalRecord.targetNickname,
+    renamedAt: latestRenamedAt || finalRecord.renamedAt,
+  };
+}
+
+function mergeRenamesMap(
+  baseRenames?: Record<string, NicknameRenameRecord>,
+  incomingRenames?: Record<string, NicknameRenameRecord>
+): Record<string, NicknameRenameRecord> {
+  const merged: Record<string, NicknameRenameRecord> = {};
+  for (const source of [baseRenames, incomingRenames]) {
+    if (!source) continue;
+    for (const [key, rec] of Object.entries(source)) {
+      const existing = merged[key];
+      if (
+        !existing ||
+        compareIsoTimestamps(rec.renamedAt, existing.renamedAt) >= 0
+      ) {
+        merged[key] = { ...rec };
+      }
+    }
+  }
+  return merged;
+}
+
+function mergeDeletedMap(
+  baseDeleted?: Record<string, string>,
+  incomingDeleted?: Record<string, string>
+): Record<string, string> {
+  const merged: Record<string, string> = {};
+  for (const source of [baseDeleted, incomingDeleted]) {
+    if (!source) continue;
+    for (const [key, deletedAt] of Object.entries(source)) {
+      const existing = merged[key];
+      if (!existing || compareIsoTimestamps(deletedAt, existing) >= 0) {
+        merged[key] = deletedAt;
+      }
+    }
+  }
+  return merged;
+}
+
 function mergeWorkouts(
   baseWorkouts: Record<string, WorkoutEntry>,
   incomingWorkouts: Record<string, WorkoutEntry>
@@ -502,14 +682,125 @@ export function mergeProfiles(
   };
 }
 
+function reconcileLocalTombstones(
+  state: LocalStoreState,
+  incomingRenames?: Record<string, NicknameRenameRecord>,
+  incomingDeleted?: Record<string, string>
+): LocalStoreState {
+  const profiles: Record<string, UserProfileData> = { ...state.profiles };
+  const renames = mergeRenamesMap(state.renames, incomingRenames);
+  const deletedNicknames = mergeDeletedMap(
+    state.deletedNicknames,
+    incomingDeleted
+  );
+  let activeNickname = state.activeNickname;
+
+  for (const [key, deletedAt] of Object.entries(deletedNicknames)) {
+    const rec = renames[key];
+    if (rec && compareIsoTimestamps(deletedAt, rec.renamedAt) >= 0) {
+      delete renames[key];
+    } else if (rec && compareIsoTimestamps(rec.renamedAt, deletedAt) > 0) {
+      delete deletedNicknames[key];
+    }
+  }
+
+  for (const key of Object.keys(profiles)) {
+    const profile = profiles[key];
+    const deletedAt = deletedNicknames[key];
+    if (!deletedAt) continue;
+
+    if (compareIsoTimestamps(profile.createdAt, deletedAt) <= 0) {
+      delete profiles[key];
+      if (activeNickname && normalizeNicknameKey(activeNickname) === key) {
+        activeNickname = null;
+      }
+    } else {
+      delete deletedNicknames[key];
+    }
+  }
+
+  for (const key of Object.keys(profiles)) {
+    const profile = profiles[key];
+    if (!profile) continue;
+
+    const chain = resolveRenameChain(key, renames);
+    if (!chain) continue;
+
+    if (compareIsoTimestamps(profile.createdAt, chain.renamedAt) > 0) {
+      delete renames[key];
+      continue;
+    }
+
+    const targetDeletedAt = deletedNicknames[chain.targetKey];
+    if (
+      targetDeletedAt &&
+      compareIsoTimestamps(profile.createdAt, targetDeletedAt) <= 0
+    ) {
+      delete profiles[key];
+      if (activeNickname && normalizeNicknameKey(activeNickname) === key) {
+        activeNickname = null;
+      }
+      continue;
+    }
+
+    const existingTarget = profiles[chain.targetKey];
+    if (existingTarget) {
+      const merged = mergeProfiles(existingTarget, profile);
+      profiles[chain.targetKey] = {
+        ...merged,
+        nickname: existingTarget.nickname,
+      };
+    } else {
+      profiles[chain.targetKey] = {
+        ...profile,
+        nickname: chain.targetNickname,
+      };
+    }
+    delete profiles[key];
+
+    if (activeNickname && normalizeNicknameKey(activeNickname) === key) {
+      activeNickname = profiles[chain.targetKey].nickname;
+    }
+  }
+
+  if (activeNickname) {
+    const activeKey = normalizeNicknameKey(activeNickname);
+    if (!profiles[activeKey]) {
+      const chain = resolveRenameChain(activeKey, renames);
+      if (chain && profiles[chain.targetKey]) {
+        activeNickname = profiles[chain.targetKey].nickname;
+      } else if (deletedNicknames[activeKey]) {
+        activeNickname = null;
+      }
+    }
+  }
+
+  return {
+    activeNickname,
+    profiles,
+    renames,
+    deletedNicknames,
+  };
+}
+
 function readLocalStorageState(): LocalStoreState {
   if (typeof window === "undefined") {
-    return { activeNickname: null, profiles: {} };
+    return {
+      activeNickname: null,
+      profiles: {},
+      renames: {},
+      deletedNicknames: {},
+    };
   }
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) {
-      return { activeNickname: null, profiles: {} };
+      return {
+        activeNickname: null,
+        profiles: {},
+        renames: {},
+        deletedNicknames: {},
+      };
     }
     const parsed = JSON.parse(raw) as Partial<LocalStoreState>;
     const nowIso = new Date().toISOString();
@@ -526,6 +817,11 @@ function readLocalStorageState(): LocalStoreState {
       }
     }
 
+    const renames = sanitizeRenamesMap(parsed?.renames);
+    const deletedNicknames = sanitizeDeletedNicknamesMap(
+      parsed?.deletedNicknames
+    );
+
     let activeNickname =
       typeof parsed?.activeNickname === "string" &&
       parsed.activeNickname.trim().length > 0
@@ -535,23 +831,40 @@ function readLocalStorageState(): LocalStoreState {
     if (activeNickname) {
       const activeKey = normalizeNicknameKey(activeNickname);
       if (!profiles[activeKey]) {
-        profiles[activeKey] = {
-          nickname: activeNickname,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          weeklyGoal: 4,
-          categories: cloneDefaultCategories(),
-          archivedCategories: buildDefaultArchivedCategories(),
-          workouts: {},
-        };
+        const chain = resolveRenameChain(activeKey, renames);
+        if (chain && profiles[chain.targetKey]) {
+          activeNickname = profiles[chain.targetKey].nickname;
+        } else if (deletedNicknames[activeKey]) {
+          activeNickname = null;
+        } else {
+          profiles[activeKey] = {
+            nickname: activeNickname,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            weeklyGoal: 4,
+            categories: cloneDefaultCategories(),
+            archivedCategories: buildDefaultArchivedCategories(),
+            workouts: {},
+          };
+        }
       } else {
         activeNickname = profiles[activeKey].nickname;
       }
     }
 
-    return { activeNickname, profiles };
+    return reconcileLocalTombstones({
+      activeNickname,
+      profiles,
+      renames,
+      deletedNicknames,
+    });
   } catch {
-    return { activeNickname: null, profiles: {} };
+    return {
+      activeNickname: null,
+      profiles: {},
+      renames: {},
+      deletedNicknames: {},
+    };
   }
 }
 
@@ -578,77 +891,305 @@ function countCompletedWorkouts(
   return count;
 }
 
+function buildLocalLeaderboardEntry(
+  profile: UserProfileData,
+  todayKey: string
+): LeaderboardEntry {
+  const { year, monthIndex0 } = parseDateKeyYearMonth(todayKey);
+  const { currentStreak, bestStreak, totalCompleted } = calculateStreaks(
+    profile.workouts,
+    todayKey
+  );
+  const monthCompleted = getMonthCompletedCount(
+    profile.workouts,
+    year,
+    monthIndex0
+  );
+
+  let totalMinutes = 0;
+  for (const entry of Object.values(profile.workouts)) {
+    if (
+      entry?.completed &&
+      typeof entry.durationMinutes === "number" &&
+      Number.isFinite(entry.durationMinutes) &&
+      entry.durationMinutes > 0
+    ) {
+      totalMinutes += Math.round(entry.durationMinutes);
+    }
+  }
+
+  return {
+    nickname: profile.nickname,
+    monthCompleted,
+    currentStreak,
+    bestStreak,
+    totalCompleted,
+    totalMinutes,
+    weeklyGoal: profile.weeklyGoal,
+    todayCompleted: Boolean(profile.workouts[todayKey]?.completed),
+    updatedAt: profile.updatedAt,
+  };
+}
+
+function isKeyTombstoned(
+  key: string,
+  state: Pick<LocalStoreState, "profiles" | "renames" | "deletedNicknames">
+): boolean {
+  if (state.profiles[key]) {
+    return false;
+  }
+  return Boolean(state.renames?.[key] || state.deletedNicknames?.[key]);
+}
+
 export function useWorkoutStore(): UseWorkoutStoreResult {
   const [hydrated, setHydrated] = useState(false);
   const [syncingCount, setSyncingCount] = useState(0);
   const [storeState, setStoreState] = useState<LocalStoreState>({
     activeNickname: null,
     profiles: {},
+    renames: {},
+    deletedNicknames: {},
   });
   const [serverNicknames, setServerNicknames] = useState<SavedNicknameItem[]>(
     []
   );
+  const [serverLeaderboard, setServerLeaderboard] = useState<
+    LeaderboardEntry[]
+  >([]);
 
   const storeRef = useRef<LocalStoreState>(storeState);
 
   const commitStore = useCallback((nextState: LocalStoreState) => {
-    storeRef.current = nextState;
-    writeLocalStorageState(nextState);
-    setStoreState(nextState);
+    const cleanState: LocalStoreState = {
+      activeNickname: nextState.activeNickname,
+      profiles: nextState.profiles,
+      renames: nextState.renames ?? storeRef.current.renames ?? {},
+      deletedNicknames:
+        nextState.deletedNicknames ?? storeRef.current.deletedNicknames ?? {},
+    };
+    storeRef.current = cleanState;
+    writeLocalStorageState(cleanState);
+    setStoreState(cleanState);
   }, []);
 
+  const applyServerDirectory = useCallback(
+    (data: WorkoutsApiResponse, stateSnapshot: LocalStoreState) => {
+      if (Array.isArray(data.savedNicknames)) {
+        setServerNicknames(
+          data.savedNicknames.filter((item) => {
+            if (!item?.nickname) return false;
+            const k = normalizeNicknameKey(item.nickname);
+            return !isKeyTombstoned(k, stateSnapshot);
+          })
+        );
+      }
+      if (Array.isArray(data.leaderboard)) {
+        setServerLeaderboard(
+          data.leaderboard.filter((item) => {
+            if (!item?.nickname) return false;
+            const k = normalizeNicknameKey(item.nickname);
+            return !isKeyTombstoned(k, stateSnapshot);
+          })
+        );
+      }
+    },
+    []
+  );
+
   const syncProfileWithApi = useCallback(
-    async (profileToSync: UserProfileData): Promise<void> => {
+    async (
+      profileToSync: UserProfileData,
+      options?: { allowCreateNew?: boolean }
+    ): Promise<void> => {
       setSyncingCount((prev) => prev + 1);
       try {
         const res = await fetch("/api/workouts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "sync", profile: profileToSync }),
+          body: JSON.stringify({
+            action: "sync",
+            profile: profileToSync,
+            todayKey: getTodayKey(),
+            ...(options?.allowCreateNew ? { allowCreateNew: true } : {}),
+          }),
         });
         if (!res.ok) {
           return;
         }
         const data = (await res.json()) as WorkoutsApiResponse;
-        if (Array.isArray(data.savedNicknames)) {
-          setServerNicknames(data.savedNicknames);
+        const incomingRenames = sanitizeRenamesMap(data.renames);
+        const incomingDeleted = sanitizeDeletedNicknamesMap(
+          data.deletedNicknames
+        );
+
+        let nextState = reconcileLocalTombstones(
+          storeRef.current,
+          incomingRenames,
+          incomingDeleted
+        );
+
+        const sentKey = normalizeNicknameKey(profileToSync.nickname);
+
+        if (data.deleted) {
+          const nextProfiles = { ...nextState.profiles };
+          delete nextProfiles[sentKey];
+          const nextDeleted = {
+            ...(nextState.deletedNicknames ?? {}),
+            [sentKey]:
+              nextState.deletedNicknames?.[sentKey] ?? new Date().toISOString(),
+          };
+          const nextActive =
+            nextState.activeNickname &&
+            normalizeNicknameKey(nextState.activeNickname) === sentKey
+              ? null
+              : nextState.activeNickname;
+          nextState = {
+            ...nextState,
+            activeNickname: nextActive,
+            profiles: nextProfiles,
+            deletedNicknames: nextDeleted,
+          };
+          commitStore(nextState);
+          applyServerDirectory(data, nextState);
+          return;
         }
+
         if (data.profile) {
           const cleanServerProfile = sanitizeProfile(
             data.profile,
             new Date().toISOString()
           );
           if (cleanServerProfile) {
-            const key = normalizeNicknameKey(cleanServerProfile.nickname);
-            const currentStore = storeRef.current;
-            const latestLocal = currentStore.profiles[key];
-            const reconciled = latestLocal
-              ? mergeProfiles(cleanServerProfile, latestLocal)
-              : cleanServerProfile;
+            const deletedAtForSent = nextState.deletedNicknames?.[sentKey];
+            const chainForSent = resolveRenameChain(sentKey, nextState.renames);
 
-            const nextActive =
-              currentStore.activeNickname &&
-              normalizeNicknameKey(currentStore.activeNickname) === key
-                ? reconciled.nickname
-                : currentStore.activeNickname;
+            if (
+              deletedAtForSent &&
+              compareIsoTimestamps(profileToSync.createdAt, deletedAtForSent) <=
+                0
+            ) {
+              const nextProfiles = { ...nextState.profiles };
+              delete nextProfiles[sentKey];
+              nextState = { ...nextState, profiles: nextProfiles };
+            } else if (
+              chainForSent &&
+              compareIsoTimestamps(
+                profileToSync.createdAt,
+                chainForSent.renamedAt
+              ) <= 0
+            ) {
+              const targetKey = chainForSent.targetKey;
+              const existingTarget = nextState.profiles[targetKey];
+              const merged = existingTarget
+                ? mergeProfiles(cleanServerProfile, existingTarget)
+                : cleanServerProfile;
+              const preservedNickname =
+                existingTarget?.nickname ??
+                (normalizeNicknameKey(cleanServerProfile.nickname) === targetKey
+                  ? cleanServerProfile.nickname
+                  : chainForSent.targetNickname);
 
-            commitStore({
-              activeNickname: nextActive,
-              profiles: {
-                ...currentStore.profiles,
-                [key]: reconciled,
-              },
-            });
+              const nextProfiles = { ...nextState.profiles };
+              delete nextProfiles[sentKey];
+              nextProfiles[targetKey] = {
+                ...merged,
+                nickname: preservedNickname,
+              };
+
+              const nextActive =
+                nextState.activeNickname &&
+                (normalizeNicknameKey(nextState.activeNickname) === targetKey ||
+                  normalizeNicknameKey(nextState.activeNickname) === sentKey)
+                  ? preservedNickname
+                  : nextState.activeNickname;
+
+              nextState = {
+                ...nextState,
+                activeNickname: nextActive,
+                profiles: nextProfiles,
+              };
+            } else {
+              const returnedKey = normalizeNicknameKey(
+                cleanServerProfile.nickname
+              );
+              const deletedAtForReturned =
+                nextState.deletedNicknames?.[returnedKey];
+
+              if (
+                !deletedAtForReturned ||
+                compareIsoTimestamps(
+                  cleanServerProfile.createdAt,
+                  deletedAtForReturned
+                ) > 0
+              ) {
+                const latestLocal = nextState.profiles[returnedKey];
+                const reconciled = latestLocal
+                  ? mergeProfiles(cleanServerProfile, latestLocal)
+                  : cleanServerProfile;
+
+                const nextProfiles = { ...nextState.profiles };
+                if (data.redirectedFrom) {
+                  delete nextProfiles[
+                    normalizeNicknameKey(data.redirectedFrom)
+                  ];
+                }
+                nextProfiles[returnedKey] = reconciled;
+
+                const nextActive =
+                  nextState.activeNickname &&
+                  normalizeNicknameKey(nextState.activeNickname) === returnedKey
+                    ? reconciled.nickname
+                    : nextState.activeNickname;
+
+                nextState = {
+                  ...nextState,
+                  activeNickname: nextActive,
+                  profiles: nextProfiles,
+                };
+              }
+            }
           }
         }
+
+        commitStore(nextState);
+        applyServerDirectory(data, nextState);
       } catch {
         // Offline or network error: local state remains persisted in localStorage
       } finally {
         setSyncingCount((prev) => Math.max(0, prev - 1));
       }
     },
-    [commitStore]
+    [applyServerDirectory, commitStore]
   );
+
+  const refreshLeaderboard = useCallback(async (): Promise<void> => {
+    setSyncingCount((prev) => prev + 1);
+    try {
+      const res = await fetch(
+        `/api/workouts?today=${encodeURIComponent(getTodayKey())}`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) {
+        return;
+      }
+      const data = (await res.json()) as WorkoutsApiResponse;
+      const incomingRenames = sanitizeRenamesMap(data.renames);
+      const incomingDeleted = sanitizeDeletedNicknamesMap(
+        data.deletedNicknames
+      );
+      const reconciled = reconcileLocalTombstones(
+        storeRef.current,
+        incomingRenames,
+        incomingDeleted
+      );
+      commitStore(reconciled);
+      applyServerDirectory(data, reconciled);
+    } catch {
+      // Ignore offline errors when refreshing leaderboard
+    } finally {
+      setSyncingCount((prev) => Math.max(0, prev - 1));
+    }
+  }, [applyServerDirectory, commitStore]);
 
   useEffect(() => {
     const initial = readLocalStorageState();
@@ -664,25 +1205,9 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
     if (activeProfile) {
       void syncProfileWithApi(activeProfile);
     } else {
-      setSyncingCount((prev) => prev + 1);
-      void fetch("/api/workouts", { cache: "no-store" })
-        .then(async (res) => {
-          if (!res.ok) {
-            return;
-          }
-          const data = (await res.json()) as WorkoutsApiResponse;
-          if (Array.isArray(data.savedNicknames)) {
-            setServerNicknames(data.savedNicknames);
-          }
-        })
-        .catch(() => {
-          // Ignore offline error on initial directory fetch
-        })
-        .finally(() => {
-          setSyncingCount((prev) => Math.max(0, prev - 1));
-        });
+      void refreshLeaderboard();
     }
-  }, [syncProfileWithApi]);
+  }, [refreshLeaderboard, syncProfileWithApi]);
 
   const loginWithNickname = useCallback(
     async (nickname: string): Promise<void> => {
@@ -696,6 +1221,13 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       const currentStore = storeRef.current;
       const existingLocal = currentStore.profiles[key];
       const hadLocal = Boolean(existingLocal);
+
+      const nextRenames = { ...(currentStore.renames ?? {}) };
+      const nextDeleted = { ...(currentStore.deletedNicknames ?? {}) };
+      if (!hadLocal) {
+        delete nextRenames[key];
+        delete nextDeleted[key];
+      }
 
       const optimisticProfile: UserProfileData = existingLocal
         ? { ...existingLocal, nickname: trimmed }
@@ -715,6 +1247,8 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
           ...currentStore.profiles,
           [key]: optimisticProfile,
         },
+        renames: nextRenames,
+        deletedNicknames: nextDeleted,
       });
 
       if (hadLocal) {
@@ -725,14 +1259,15 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       setSyncingCount((prev) => prev + 1);
       try {
         const getRes = await fetch(
-          `/api/workouts?nickname=${encodeURIComponent(trimmed)}`,
+          `/api/workouts?nickname=${encodeURIComponent(trimmed)}&today=${encodeURIComponent(getTodayKey())}`,
           { cache: "no-store" }
         );
         if (getRes.ok) {
           const data = (await getRes.json()) as WorkoutsApiResponse;
-          if (Array.isArray(data.savedNicknames)) {
-            setServerNicknames(data.savedNicknames);
-          }
+          const incomingRenames = sanitizeRenamesMap(data.renames);
+          const incomingDeleted = sanitizeDeletedNicknamesMap(
+            data.deletedNicknames
+          );
           const serverProfile = data.profile
             ? sanitizeProfile(data.profile, nowIso)
             : null;
@@ -782,19 +1317,43 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
                 ? hydratedProfile.nickname
                 : latestStore.activeNickname;
 
-            commitStore({
+            const mergedRenames = mergeRenamesMap(
+              latestStore.renames,
+              incomingRenames
+            );
+            const mergedDeleted = mergeDeletedMap(
+              latestStore.deletedNicknames,
+              incomingDeleted
+            );
+            delete mergedRenames[key];
+            delete mergedDeleted[key];
+
+            const nextState = reconcileLocalTombstones({
               activeNickname: nextActive,
               profiles: {
                 ...latestStore.profiles,
                 [key]: hydratedProfile,
               },
+              renames: mergedRenames,
+              deletedNicknames: mergedDeleted,
             });
+
+            commitStore(nextState);
+            applyServerDirectory(data, nextState);
 
             if (hasLocalWorkouts || hasLocalCategoryEdits) {
               await syncProfileWithApi(hydratedProfile);
             }
             return;
           }
+
+          const updatedState = reconcileLocalTombstones(
+            storeRef.current,
+            incomingRenames,
+            incomingDeleted
+          );
+          commitStore(updatedState);
+          applyServerDirectory(data, updatedState);
         }
       } catch {
         // Ignore GET error and attempt sync fallback or stay offline
@@ -803,9 +1362,9 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       }
 
       const latestProfile = storeRef.current.profiles[key] ?? optimisticProfile;
-      await syncProfileWithApi(latestProfile);
+      await syncProfileWithApi(latestProfile, { allowCreateNew: true });
     },
-    [commitStore, syncProfileWithApi]
+    [applyServerDirectory, commitStore, syncProfileWithApi]
   );
 
   const logoutNickname = useCallback((): void => {
@@ -813,6 +1372,8 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
     commitStore({
       activeNickname: null,
       profiles: currentStore.profiles,
+      renames: currentStore.renames,
+      deletedNicknames: currentStore.deletedNicknames,
     });
   }, [commitStore]);
 
@@ -871,18 +1432,41 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       };
 
       const nextProfiles = { ...currentStore.profiles };
+      const nextRenames = { ...(currentStore.renames ?? {}) };
+      const nextDeleted = { ...(currentStore.deletedNicknames ?? {}) };
+
       if (oldKey !== newKey) {
         delete nextProfiles[oldKey];
+        nextRenames[oldKey] = {
+          targetNickname: trimmed,
+          renamedAt: nowIso,
+        };
+        for (const [k, rec] of Object.entries(nextRenames)) {
+          if (normalizeNicknameKey(rec.targetNickname) === oldKey) {
+            nextRenames[k] = {
+              targetNickname: trimmed,
+              renamedAt: nowIso,
+            };
+          }
+        }
+        delete nextRenames[newKey];
+        delete nextDeleted[oldKey];
       }
+      delete nextDeleted[newKey];
       nextProfiles[newKey] = renamedProfile;
 
       commitStore({
         activeNickname: trimmed,
         profiles: nextProfiles,
+        renames: nextRenames,
+        deletedNicknames: nextDeleted,
       });
 
       if (oldKey !== newKey) {
         setServerNicknames((prev) =>
+          prev.filter((item) => normalizeNicknameKey(item.nickname) !== oldKey)
+        );
+        setServerLeaderboard((prev) =>
           prev.filter((item) => normalizeNicknameKey(item.nickname) !== oldKey)
         );
       }
@@ -896,34 +1480,54 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
             action: "rename",
             oldNickname: oldActive,
             newNickname: trimmed,
+            profile: renamedProfile,
+            todayKey: getTodayKey(),
           }),
         });
         if (res.ok) {
           const data = (await res.json()) as WorkoutsApiResponse;
-          if (Array.isArray(data.savedNicknames)) {
-            setServerNicknames(data.savedNicknames);
-          }
+          const incomingRenames = sanitizeRenamesMap(data.renames);
+          const incomingDeleted = sanitizeDeletedNicknamesMap(
+            data.deletedNicknames
+          );
+
+          let nextState = reconcileLocalTombstones(
+            storeRef.current,
+            incomingRenames,
+            incomingDeleted
+          );
+
           if (data.profile) {
             const cleanServer = sanitizeProfile(data.profile, nowIso);
             if (cleanServer) {
-              const latestStore = storeRef.current;
-              const latestLocal = latestStore.profiles[newKey];
+              const targetKey = normalizeNicknameKey(cleanServer.nickname);
+              const latestLocal = nextState.profiles[targetKey];
               const reconciled = latestLocal
                 ? mergeProfiles(cleanServer, latestLocal)
                 : cleanServer;
-              commitStore({
+
+              const updatedProfiles = { ...nextState.profiles };
+              if (oldKey !== targetKey) {
+                delete updatedProfiles[oldKey];
+              }
+              updatedProfiles[targetKey] = reconciled;
+
+              nextState = {
+                ...nextState,
                 activeNickname:
-                  latestStore.activeNickname &&
-                  normalizeNicknameKey(latestStore.activeNickname) === newKey
+                  nextState.activeNickname &&
+                  (normalizeNicknameKey(nextState.activeNickname) ===
+                    targetKey ||
+                    normalizeNicknameKey(nextState.activeNickname) === oldKey)
                     ? reconciled.nickname
-                    : latestStore.activeNickname,
-                profiles: {
-                  ...latestStore.profiles,
-                  [newKey]: reconciled,
-                },
-              });
+                    : nextState.activeNickname,
+                profiles: updatedProfiles,
+              };
             }
           }
+
+          commitStore(nextState);
+          applyServerDirectory(data, nextState);
         }
       } catch {
         // Offline fallback: rename already persisted in localStorage
@@ -933,7 +1537,92 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
 
       return true;
     },
-    [commitStore]
+    [applyServerDirectory, commitStore]
+  );
+
+  const deleteSavedNickname = useCallback(
+    async (nickname: string): Promise<boolean> => {
+      const trimmed = nickname.trim();
+      if (!trimmed) {
+        return false;
+      }
+
+      const targetKey = normalizeNicknameKey(trimmed);
+      const currentStore = storeRef.current;
+      const activeKey = currentStore.activeNickname
+        ? normalizeNicknameKey(currentStore.activeNickname)
+        : null;
+
+      if (activeKey === targetKey) {
+        return false;
+      }
+
+      const nowIso = new Date().toISOString();
+      const nextProfiles = { ...currentStore.profiles };
+      delete nextProfiles[targetKey];
+
+      const nextDeleted = {
+        ...(currentStore.deletedNicknames ?? {}),
+        [targetKey]: nowIso,
+      };
+      const nextRenames = { ...(currentStore.renames ?? {}) };
+      for (const [k, rec] of Object.entries(nextRenames)) {
+        if (
+          k === targetKey ||
+          normalizeNicknameKey(rec.targetNickname) === targetKey
+        ) {
+          delete nextRenames[k];
+        }
+      }
+
+      commitStore({
+        activeNickname: currentStore.activeNickname,
+        profiles: nextProfiles,
+        renames: nextRenames,
+        deletedNicknames: nextDeleted,
+      });
+
+      setServerNicknames((prev) =>
+        prev.filter((item) => normalizeNicknameKey(item.nickname) !== targetKey)
+      );
+      setServerLeaderboard((prev) =>
+        prev.filter((item) => normalizeNicknameKey(item.nickname) !== targetKey)
+      );
+
+      setSyncingCount((prev) => prev + 1);
+      try {
+        const res = await fetch("/api/workouts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "delete",
+            nickname: trimmed,
+            todayKey: getTodayKey(),
+          }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as WorkoutsApiResponse;
+          const incomingRenames = sanitizeRenamesMap(data.renames);
+          const incomingDeleted = sanitizeDeletedNicknamesMap(
+            data.deletedNicknames
+          );
+          const nextState = reconcileLocalTombstones(
+            storeRef.current,
+            incomingRenames,
+            incomingDeleted
+          );
+          commitStore(nextState);
+          applyServerDirectory(data, nextState);
+        }
+      } catch {
+        // Offline fallback: delete tombstone remains in localStorage
+      } finally {
+        setSyncingCount((prev) => Math.max(0, prev - 1));
+      }
+
+      return true;
+    },
+    [applyServerDirectory, commitStore]
   );
 
   const setWeeklyGoal = useCallback(
@@ -1421,6 +2110,8 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       const nextProfiles: Record<string, UserProfileData> = {
         ...currentStore.profiles,
       };
+      const nextRenames = { ...(currentStore.renames ?? {}) };
+      const nextDeleted = { ...(currentStore.deletedNicknames ?? {}) };
       const importedKeys = new Set<string>();
 
       const applyRestoredProfile = (rawCandidate: unknown): string | null => {
@@ -1464,6 +2155,8 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
             ...stampedWorkouts,
           },
         };
+        delete nextRenames[key];
+        delete nextDeleted[key];
         importedKeys.add(key);
         return clean.nickname;
       };
@@ -1529,12 +2222,14 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       commitStore({
         activeNickname: resolvedActive,
         profiles: nextProfiles,
+        renames: nextRenames,
+        deletedNicknames: nextDeleted,
       });
 
       for (const key of Array.from(importedKeys)) {
         const profileToSync = nextProfiles[key];
         if (profileToSync) {
-          await syncProfileWithApi(profileToSync);
+          await syncProfileWithApi(profileToSync, { allowCreateNew: true });
         }
       }
 
@@ -1562,6 +2257,9 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
         continue;
       }
       const key = normalizeNicknameKey(item.nickname);
+      if (isKeyTombstoned(key, storeState)) {
+        continue;
+      }
       mergedMap.set(key, {
         nickname: item.nickname.trim(),
         totalCompleted: item.totalCompleted ?? 0,
@@ -1587,7 +2285,50 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
     return Array.from(mergedMap.values()).sort((a, b) =>
       compareIsoTimestamps(b.updatedAt, a.updatedAt)
     );
-  }, [serverNicknames, storeState.profiles]);
+  }, [serverNicknames, storeState]);
+
+  const leaderboard = useMemo<LeaderboardEntry[]>(() => {
+    const todayKey = getTodayKey();
+    const mergedMap = new Map<string, LeaderboardEntry>();
+
+    for (const item of serverLeaderboard) {
+      if (!item?.nickname) {
+        continue;
+      }
+      const key = normalizeNicknameKey(item.nickname);
+      if (isKeyTombstoned(key, storeState)) {
+        continue;
+      }
+      mergedMap.set(key, item);
+    }
+
+    for (const [key, localProfile] of Object.entries(storeState.profiles)) {
+      const localEntry = buildLocalLeaderboardEntry(localProfile, todayKey);
+      const existing = mergedMap.get(key);
+      if (
+        !existing ||
+        compareIsoTimestamps(localEntry.updatedAt, existing.updatedAt) >= 0
+      ) {
+        mergedMap.set(key, localEntry);
+      }
+    }
+
+    return Array.from(mergedMap.values()).sort((a, b) => {
+      if (b.monthCompleted !== a.monthCompleted) {
+        return b.monthCompleted - a.monthCompleted;
+      }
+      if (b.currentStreak !== a.currentStreak) {
+        return b.currentStreak - a.currentStreak;
+      }
+      if (b.totalCompleted !== a.totalCompleted) {
+        return b.totalCompleted - a.totalCompleted;
+      }
+      if (b.totalMinutes !== a.totalMinutes) {
+        return b.totalMinutes - a.totalMinutes;
+      }
+      return a.nickname.localeCompare(b.nickname);
+    });
+  }, [serverLeaderboard, storeState]);
 
   return {
     hydrated,
@@ -1595,9 +2336,12 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
     activeNickname: profile ? profile.nickname : storeState.activeNickname,
     profile,
     savedNicknames,
+    leaderboard,
+    refreshLeaderboard,
     loginWithNickname,
     logoutNickname,
     renameActiveNickname,
+    deleteSavedNickname,
     setWeeklyGoal,
     addWorkoutCategory,
     removeWorkoutCategory,

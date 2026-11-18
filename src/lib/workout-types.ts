@@ -7,6 +7,25 @@ export type DefaultWorkoutCategoryId =
 
 export type WorkoutCategory = string;
 
+export type LeaderboardSortBy = "month" | "streak" | "total";
+
+export interface LeaderboardEntry {
+  nickname: string;
+  monthCompleted: number;
+  currentStreak: number;
+  bestStreak: number;
+  totalCompleted: number;
+  totalMinutes: number;
+  weeklyGoal: number;
+  todayCompleted: boolean;
+  updatedAt: string;
+}
+
+export interface NicknameRenameRecord {
+  targetNickname: string;
+  renamedAt: string; // ISO timestamp
+}
+
 export interface WorkoutCategoryMeta {
   id: WorkoutCategory;
   label: string;

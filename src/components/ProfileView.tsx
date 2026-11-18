@@ -14,6 +14,7 @@ export interface ProfileViewProps {
   syncing: boolean;
   onSwitchNickname: (nickname: string) => Promise<void> | void;
   onRenameNickname: (newNickname: string) => Promise<boolean> | boolean;
+  onDeleteNickname?: (nickname: string) => Promise<boolean> | boolean;
   onLogout: () => void;
 }
 
@@ -23,6 +24,7 @@ export default function ProfileView({
   syncing,
   onSwitchNickname,
   onRenameNickname,
+  onDeleteNickname,
   onLogout,
 }: ProfileViewProps) {
   const { currentStreak, bestStreak, totalCompleted } = useMemo(
@@ -42,10 +44,17 @@ export default function ProfileView({
   // Switch / add new user state
   const [switchInput, setSwitchInput] = useState("");
   const [switchBusy, setSwitchBusy] = useState(false);
+  const [confirmDeleteKey, setConfirmDeleteKey] = useState<string | null>(null);
+  const [deleteBusyKey, setDeleteBusyKey] = useState<string | null>(null);
+  const [switchFeedback, setSwitchFeedback] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
 
   useEffect(() => {
     setRenameDraft(profile.nickname);
     setIsRenaming(false);
+    setConfirmDeleteKey(null);
   }, [profile.nickname]);
 
   // Ensure current user always appears in the saved list
@@ -113,6 +122,8 @@ export default function ProfileView({
     const trimmed = switchInput.trim();
     if (!trimmed || switchBusy) return;
     setSwitchBusy(true);
+    setSwitchFeedback(null);
+    setConfirmDeleteKey(null);
     try {
       await onSwitchNickname(trimmed);
       setSwitchInput("");
@@ -123,7 +134,7 @@ export default function ProfileView({
   };
 
   const handleTapSavedUser = async (targetNickname: string) => {
-    if (switchBusy) return;
+    if (switchBusy || deleteBusyKey) return;
     if (
       targetNickname.trim().toLowerCase() ===
       profile.nickname.trim().toLowerCase()
@@ -131,11 +142,37 @@ export default function ProfileView({
       return;
     }
     setSwitchBusy(true);
+    setSwitchFeedback(null);
+    setConfirmDeleteKey(null);
     try {
       await onSwitchNickname(targetNickname);
       setRenameFeedback(null);
     } finally {
       setSwitchBusy(false);
+    }
+  };
+
+  const handleConfirmDeleteUser = async (targetNickname: string) => {
+    if (!onDeleteNickname || deleteBusyKey || switchBusy) return;
+    const targetKey = targetNickname.trim().toLowerCase();
+    setDeleteBusyKey(targetKey);
+    setSwitchFeedback(null);
+    try {
+      const ok = await onDeleteNickname(targetNickname);
+      setConfirmDeleteKey(null);
+      if (ok) {
+        setSwitchFeedback({
+          ok: true,
+          text: `'${targetNickname}' 프로필이 정리되었어요 ✓`,
+        });
+      } else {
+        setSwitchFeedback({
+          ok: false,
+          text: "현재 사용 중인 프로필은 삭제할 수 없어요.",
+        });
+      }
+    } finally {
+      setDeleteBusyKey(null);
     }
   };
 
@@ -301,38 +338,104 @@ export default function ProfileView({
 
         <div className="flex flex-wrap gap-2 mb-4">
           {mergedUsers.map((user) => {
+            const userKey = user.nickname.trim().toLowerCase();
             const isCurrent =
-              user.nickname.trim().toLowerCase() ===
-              profile.nickname.trim().toLowerCase();
+              userKey === profile.nickname.trim().toLowerCase();
+            const isConfirming = confirmDeleteKey === userKey;
+            const isDeleting = deleteBusyKey === userKey;
+
+            if (!isCurrent && onDeleteNickname && isConfirming) {
+              return (
+                <div
+                  key={userKey}
+                  className="inline-flex items-center gap-1.5 rounded-full bg-[#FDF2F0] border border-[#F0C8C1] pl-3 pr-1.5 py-1 text-xs"
+                >
+                  <span className="font-semibold text-[#7A352A]">
+                    {user.nickname} 삭제할까요?
+                  </span>
+                  <button
+                    type="button"
+                    disabled={isDeleting}
+                    onClick={() => handleConfirmDeleteUser(user.nickname)}
+                    className="rounded-full bg-[#C94A38] hover:bg-[#B23E2E] disabled:opacity-60 px-2.5 py-1 text-[11px] font-bold text-white transition"
+                  >
+                    {isDeleting ? "삭제 중" : "삭제 확인"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isDeleting}
+                    onClick={() => setConfirmDeleteKey(null)}
+                    className="rounded-full bg-white border border-[#E5DEC9] px-2.5 py-1 text-[11px] font-semibold text-[#5B554C] transition"
+                  >
+                    취소
+                  </button>
+                </div>
+              );
+            }
+
             return (
-              <button
-                key={user.nickname.toLowerCase()}
-                type="button"
-                disabled={switchBusy}
-                onClick={() => handleTapSavedUser(user.nickname)}
-                className={`inline-flex items-center gap-1.5 rounded-full px-3.5 py-2 text-xs font-semibold transition ${
+              <div
+                key={userKey}
+                className={`inline-flex items-center rounded-full transition ${
                   isCurrent
                     ? "bg-[#6CA824] text-white shadow-[0_4px_12px_rgba(108,168,36,0.25)]"
-                    : "bg-[#FAF7F2] hover:bg-[#F1ECE2] text-[#2C2A27] border border-[#E5DEC9]"
+                    : "bg-[#FAF7F2] text-[#2C2A27] border border-[#E5DEC9]"
                 }`}
               >
-                <span>{user.nickname}</span>
-                <span
-                  className={`text-[11px] ${
-                    isCurrent ? "text-white/90" : "text-[#7D766B]"
+                <button
+                  type="button"
+                  disabled={switchBusy || Boolean(deleteBusyKey)}
+                  onClick={() => handleTapSavedUser(user.nickname)}
+                  className={`inline-flex items-center gap-1.5 py-2 text-xs font-semibold transition ${
+                    isCurrent
+                      ? "px-3.5"
+                      : onDeleteNickname
+                      ? "pl-3.5 pr-1.5 hover:bg-[#F1ECE2] rounded-l-full"
+                      : "px-3.5 hover:bg-[#F1ECE2] rounded-full"
                   }`}
                 >
-                  · {user.totalCompleted}회
-                </span>
-                {isCurrent && (
-                  <span className="text-[10px] bg-white/20 px-1.5 py-0.5 rounded-full">
-                    현재
+                  <span>{user.nickname}</span>
+                  <span
+                    className={`text-[11px] ${
+                      isCurrent ? "text-white/90" : "text-[#7D766B]"
+                    }`}
+                  >
+                    · {user.totalCompleted}회
                   </span>
+                  {isCurrent && (
+                    <span className="text-[10px] bg-white/20 px-1.5 py-0.5 rounded-full">
+                      현재
+                    </span>
+                  )}
+                </button>
+                {!isCurrent && onDeleteNickname && (
+                  <button
+                    type="button"
+                    disabled={switchBusy || Boolean(deleteBusyKey)}
+                    onClick={() => {
+                      setSwitchFeedback(null);
+                      setConfirmDeleteKey(userKey);
+                    }}
+                    aria-label={`${user.nickname} 프로필 삭제`}
+                    className="pr-2.5 pl-1 py-2 text-[11px] font-bold text-[#9B9285] hover:text-[#C94A38] transition rounded-r-full"
+                  >
+                    ✕
+                  </button>
                 )}
-              </button>
+              </div>
             );
           })}
         </div>
+
+        {switchFeedback && (
+          <p
+            className={`mb-3 text-xs font-medium ${
+              switchFeedback.ok ? "text-[#5B8E1D]" : "text-[#C94A38]"
+            }`}
+          >
+            {switchFeedback.text}
+          </p>
+        )}
 
         <form onSubmit={handleSwitchSubmit} className="flex items-center gap-2">
           <input

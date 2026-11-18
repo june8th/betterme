@@ -3,11 +3,12 @@
 import React, { useState } from "react";
 import { useWorkoutStore } from "@/lib/workout-store";
 import CalendarBoard from "@/components/CalendarBoard";
+import LeaderboardView from "@/components/LeaderboardView";
 import OnboardingView from "@/components/OnboardingView";
 import ProfileView from "@/components/ProfileView";
 import SettingsView from "@/components/SettingsView";
 
-type AppTab = "calendar" | "profile" | "settings";
+type AppTab = "calendar" | "leaderboard" | "profile" | "settings";
 
 export default function HomePage() {
   const {
@@ -16,9 +17,12 @@ export default function HomePage() {
     activeNickname,
     profile,
     savedNicknames,
+    leaderboard,
+    refreshLeaderboard,
     loginWithNickname,
     logoutNickname,
     renameActiveNickname,
+    deleteSavedNickname,
     setWeeklyGoal,
     addWorkoutCategory,
     removeWorkoutCategory,
@@ -133,6 +137,13 @@ export default function HomePage() {
             onOpenProfileTab={() => setActiveTab("profile")}
             onOpenSettingsTab={() => setActiveTab("settings")}
           />
+        ) : activeTab === "leaderboard" ? (
+          <LeaderboardView
+            currentNickname={profile.nickname}
+            entries={leaderboard}
+            syncing={syncing}
+            onRefresh={refreshLeaderboard}
+          />
         ) : activeTab === "profile" ? (
           <ProfileView
             profile={profile}
@@ -140,6 +151,7 @@ export default function HomePage() {
             syncing={syncing}
             onSwitchNickname={loginWithNickname}
             onRenameNickname={renameActiveNickname}
+            onDeleteNickname={deleteSavedNickname}
             onLogout={logoutNickname}
           />
         ) : (
@@ -157,12 +169,12 @@ export default function HomePage() {
         )}
       </main>
 
-      {/* Fixed iOS Bottom 3-Tab Navigation Bar */}
+      {/* Fixed iOS Bottom 4-Tab Navigation Bar */}
       <nav
         aria-label="하단 탭 내비게이션"
         className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-[430px] z-30 bg-white/90 backdrop-blur-md border-t border-[#EAE3D5] pb-safe"
       >
-        <div className="grid grid-cols-3 px-3 pt-2 pb-1">
+        <div className="grid grid-cols-4 px-2 pt-2 pb-1">
           <button
             type="button"
             onClick={() => setActiveTab("calendar")}
@@ -174,7 +186,7 @@ export default function HomePage() {
             }`}
           >
             <span
-              className={`px-3.5 py-1 rounded-full transition ${
+              className={`px-3 py-1 rounded-full transition ${
                 activeTab === "calendar" ? "bg-[#6CA824]/12" : ""
               }`}
             >
@@ -215,6 +227,58 @@ export default function HomePage() {
 
           <button
             type="button"
+            onClick={() => setActiveTab("leaderboard")}
+            aria-current={activeTab === "leaderboard" ? "page" : undefined}
+            className={`flex flex-col items-center justify-center gap-1 py-1 rounded-2xl transition ${
+              activeTab === "leaderboard"
+                ? "text-[#6CA824]"
+                : "text-[#8C8479] hover:text-[#5B554C]"
+            }`}
+          >
+            <span
+              className={`px-3 py-1 rounded-full transition ${
+                activeTab === "leaderboard" ? "bg-[#6CA824]/12" : ""
+              }`}
+            >
+              <svg
+                className="w-5 h-5"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M8 4.5H16V10C16 12.2091 14.2091 14 12 14C9.79086 14 8 12.2091 8 10V4.5Z"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M8 6.5H5.5C4.94772 6.5 4.5 6.94772 4.5 7.5V8.5C4.5 9.88071 5.61929 11 7 11H8"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+                <path
+                  d="M16 6.5H18.5C19.0523 6.5 19.5 6.94772 19.5 7.5V8.5C19.5 9.88071 18.3807 11 17 11H16"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+                <path
+                  d="M12 14V18M8.5 19.5H15.5"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </span>
+            <span className="text-[11px] font-bold tracking-tight">
+              리더보드
+            </span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setActiveTab("profile")}
             aria-current={activeTab === "profile" ? "page" : undefined}
             className={`flex flex-col items-center justify-center gap-1 py-1 rounded-2xl transition ${
@@ -224,7 +288,7 @@ export default function HomePage() {
             }`}
           >
             <span
-              className={`px-3.5 py-1 rounded-full transition ${
+              className={`px-3 py-1 rounded-full transition ${
                 activeTab === "profile" ? "bg-[#6CA824]/12" : ""
               }`}
             >
@@ -263,7 +327,7 @@ export default function HomePage() {
             }`}
           >
             <span
-              className={`px-3.5 py-1 rounded-full transition ${
+              className={`px-3 py-1 rounded-full transition ${
                 activeTab === "settings" ? "bg-[#6CA824]/12" : ""
               }`}
             >
