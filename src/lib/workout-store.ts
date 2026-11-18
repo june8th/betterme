@@ -39,6 +39,7 @@ export interface UseWorkoutStoreResult {
   }>;
   leaderboard: LeaderboardEntry[];
   refreshLeaderboard: () => Promise<void>;
+  syncNow: () => Promise<void>;
   loginWithNickname: (nickname: string) => Promise<void>;
   logoutNickname: () => void;
   renameActiveNickname: (newNickname: string) => Promise<boolean>;
@@ -1191,6 +1192,20 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
     }
   }, [applyServerDirectory, commitStore]);
 
+  const syncNow = useCallback(async (): Promise<void> => {
+    const currentStore = storeRef.current;
+    const activeKey = currentStore.activeNickname
+      ? normalizeNicknameKey(currentStore.activeNickname)
+      : null;
+    const activeProfile = activeKey ? currentStore.profiles[activeKey] : null;
+
+    if (activeProfile) {
+      await syncProfileWithApi(activeProfile);
+    } else {
+      await refreshLeaderboard();
+    }
+  }, [refreshLeaderboard, syncProfileWithApi]);
+
   useEffect(() => {
     const initial = readLocalStorageState();
     storeRef.current = initial;
@@ -2338,6 +2353,7 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
     savedNicknames,
     leaderboard,
     refreshLeaderboard,
+    syncNow,
     loginWithNickname,
     logoutNickname,
     renameActiveNickname,

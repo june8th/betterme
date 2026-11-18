@@ -6,6 +6,7 @@ import CalendarBoard from "@/components/CalendarBoard";
 import LeaderboardView from "@/components/LeaderboardView";
 import OnboardingView from "@/components/OnboardingView";
 import ProfileView from "@/components/ProfileView";
+import PullToRefresh from "@/components/PullToRefresh";
 import SettingsView from "@/components/SettingsView";
 
 type AppTab = "calendar" | "leaderboard" | "profile" | "settings";
@@ -19,6 +20,7 @@ export default function HomePage() {
     savedNicknames,
     leaderboard,
     refreshLeaderboard,
+    syncNow,
     loginWithNickname,
     logoutNickname,
     renameActiveNickname,
@@ -35,6 +37,14 @@ export default function HomePage() {
   } = useWorkoutStore();
 
   const [activeTab, setActiveTab] = useState<AppTab>("calendar");
+
+  const handlePullRefresh = async () => {
+    await Promise.race([
+      syncNow(),
+      new Promise<void>((resolve) => setTimeout(resolve, 2500)),
+    ]);
+    window.location.reload();
+  };
 
   // Clean warm skeleton while hydrating localStorage (prevents flicker on iPhone Safari)
   if (!hydrated) {
@@ -60,20 +70,23 @@ export default function HomePage() {
   // Welcome / Nickname Onboarding when no active user is selected
   if (!activeNickname || !profile) {
     return (
-      <OnboardingView
-        savedNicknames={savedNicknames}
-        onStart={async (nickname) => {
-          await loginWithNickname(nickname);
-          setActiveTab("calendar");
-        }}
-      />
+      <PullToRefresh onRefresh={handlePullRefresh}>
+        <OnboardingView
+          savedNicknames={savedNicknames}
+          onStart={async (nickname) => {
+            await loginWithNickname(nickname);
+            setActiveTab("calendar");
+          }}
+        />
+      </PullToRefresh>
     );
   }
 
   const userInitial = profile.nickname.trim().slice(0, 1).toUpperCase() || "B";
 
   return (
-    <div className="min-h-dvh bg-[#FAF7F2] text-[#2C2A27] flex flex-col">
+    <PullToRefresh onRefresh={handlePullRefresh}>
+      <div className="min-h-dvh bg-[#FAF7F2] text-[#2C2A27] flex flex-col">
       {/* Top Safe-Area Sticky Bar */}
       <header className="sticky top-0 z-30 bg-[#FAF7F2]/90 backdrop-blur-md border-b border-[#EAE3D5]/85 pt-safe px-4 pb-2.5">
         <div className="flex items-center justify-between gap-3">
@@ -357,6 +370,7 @@ export default function HomePage() {
           </button>
         </div>
       </nav>
-    </div>
+      </div>
+    </PullToRefresh>
   );
 }
