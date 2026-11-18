@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import { useRouter } from "next/navigation";
 import { useWorkoutStore } from "@/lib/workout-store";
 import CalendarBoard from "@/components/CalendarBoard";
 import LeaderboardView from "@/components/LeaderboardView";
@@ -36,14 +37,15 @@ export default function HomePage() {
     importBackupJson,
   } = useWorkoutStore();
 
+  const router = useRouter();
   const [activeTab, setActiveTab] = useState<AppTab>("calendar");
 
   const handlePullRefresh = async () => {
     await Promise.race([
       syncNow(),
-      new Promise<void>((resolve) => setTimeout(resolve, 2500)),
+      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
     ]);
-    window.location.reload();
+    router.refresh();
   };
 
   // Clean warm skeleton while hydrating localStorage (prevents flicker on iPhone Safari)
@@ -70,23 +72,24 @@ export default function HomePage() {
   // Welcome / Nickname Onboarding when no active user is selected
   if (!activeNickname || !profile) {
     return (
-      <PullToRefresh onRefresh={handlePullRefresh}>
-        <OnboardingView
-          savedNicknames={savedNicknames}
-          onStart={async (nickname) => {
-            await loginWithNickname(nickname);
-            setActiveTab("calendar");
-          }}
-        />
-      </PullToRefresh>
+      <div className="min-h-dvh bg-[#FAF7F2] flex flex-col">
+        <PullToRefresh onRefresh={handlePullRefresh}>
+          <OnboardingView
+            savedNicknames={savedNicknames}
+            onStart={async (nickname) => {
+              await loginWithNickname(nickname);
+              setActiveTab("calendar");
+            }}
+          />
+        </PullToRefresh>
+      </div>
     );
   }
 
   const userInitial = profile.nickname.trim().slice(0, 1).toUpperCase() || "B";
 
   return (
-    <PullToRefresh onRefresh={handlePullRefresh}>
-      <div className="min-h-dvh bg-[#FAF7F2] text-[#2C2A27] flex flex-col">
+    <div className="min-h-dvh bg-[#FAF7F2] text-[#2C2A27] flex flex-col">
       {/* Top Safe-Area Sticky Bar */}
       <header className="sticky top-0 z-30 bg-[#FAF7F2]/90 backdrop-blur-md border-b border-[#EAE3D5]/85 pt-safe px-4 pb-2.5">
         <div className="flex items-center justify-between gap-3">
@@ -141,7 +144,8 @@ export default function HomePage() {
       </header>
 
       {/* Main Scrollable Content Area */}
-      <main className="flex-1 pb-24">
+      <PullToRefresh onRefresh={handlePullRefresh}>
+        <main className="flex-1 pb-24">
         {activeTab === "calendar" ? (
           <CalendarBoard
             profile={profile}
@@ -181,7 +185,8 @@ export default function HomePage() {
             onImportBackup={importBackupJson}
           />
         )}
-      </main>
+        </main>
+      </PullToRefresh>
 
       {/* Fixed iOS Bottom 4-Tab Navigation Bar */}
       <nav
@@ -371,7 +376,6 @@ export default function HomePage() {
           </button>
         </div>
       </nav>
-      </div>
-    </PullToRefresh>
+    </div>
   );
 }
