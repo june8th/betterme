@@ -957,8 +957,12 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
   const [serverLeaderboard, setServerLeaderboard] = useState<
     LeaderboardEntry[]
   >([]);
+  const [todayKeyState, setTodayKeyState] = useState<string>(() =>
+    getTodayKey()
+  );
 
   const storeRef = useRef<LocalStoreState>(storeState);
+  const lastForegroundSyncRef = useRef<number>(0);
 
   const commitStore = useCallback((nextState: LocalStoreState) => {
     const cleanState: LocalStoreState = {
@@ -1217,12 +1221,40 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       : null;
     const activeProfile = activeKey ? initial.profiles[activeKey] : null;
 
+    lastForegroundSyncRef.current = Date.now();
     if (activeProfile) {
       void syncProfileWithApi(activeProfile);
     } else {
       void refreshLeaderboard();
     }
   }, [refreshLeaderboard, syncProfileWithApi]);
+
+  useEffect(() => {
+    const handleForeground = (event: Event) => {
+      if (
+        event.type === "visibilitychange" &&
+        document.visibilityState !== "visible"
+      ) {
+        return;
+      }
+
+      const latestToday = getTodayKey();
+      setTodayKeyState((prev) => (prev === latestToday ? prev : latestToday));
+
+      const nowMs = Date.now();
+      if (nowMs - lastForegroundSyncRef.current >= 20_000) {
+        lastForegroundSyncRef.current = nowMs;
+        void syncNow();
+      }
+    };
+
+    window.addEventListener("focus", handleForeground);
+    document.addEventListener("visibilitychange", handleForeground);
+    return () => {
+      window.removeEventListener("focus", handleForeground);
+      document.removeEventListener("visibilitychange", handleForeground);
+    };
+  }, [syncNow]);
 
   const loginWithNickname = useCallback(
     async (nickname: string): Promise<void> => {
@@ -1390,7 +1422,8 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       renames: currentStore.renames,
       deletedNicknames: currentStore.deletedNicknames,
     });
-  }, [commitStore]);
+    void refreshLeaderboard();
+  }, [commitStore, refreshLeaderboard]);
 
   const renameActiveNickname = useCallback(
     async (newNickname: string): Promise<boolean> => {
@@ -2303,7 +2336,7 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
   }, [serverNicknames, storeState]);
 
   const leaderboard = useMemo<LeaderboardEntry[]>(() => {
-    const todayKey = getTodayKey();
+    const todayKey = todayKeyState;
     const mergedMap = new Map<string, LeaderboardEntry>();
 
     for (const item of serverLeaderboard) {
@@ -2343,7 +2376,7 @@ export function useWorkoutStore(): UseWorkoutStoreResult {
       }
       return a.nickname.localeCompare(b.nickname);
     });
-  }, [serverLeaderboard, storeState]);
+  }, [serverLeaderboard, storeState, todayKeyState]);
 
   return {
     hydrated,

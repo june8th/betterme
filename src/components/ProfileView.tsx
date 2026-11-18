@@ -15,6 +15,7 @@ export interface ProfileViewProps {
   onSwitchNickname: (nickname: string) => Promise<void> | void;
   onRenameNickname: (newNickname: string) => Promise<boolean> | boolean;
   onDeleteNickname?: (nickname: string) => Promise<boolean> | boolean;
+  onRefreshDirectory?: () => Promise<void> | void;
   onLogout: () => void;
 }
 
@@ -25,6 +26,7 @@ export default function ProfileView({
   onSwitchNickname,
   onRenameNickname,
   onDeleteNickname,
+  onRefreshDirectory,
   onLogout,
 }: ProfileViewProps) {
   const { currentStreak, bestStreak, totalCompleted } = useMemo(
@@ -56,6 +58,10 @@ export default function ProfileView({
     setIsRenaming(false);
     setConfirmDeleteKey(null);
   }, [profile.nickname]);
+
+  useEffect(() => {
+    void onRefreshDirectory?.();
+  }, [onRefreshDirectory]);
 
   // Ensure current user always appears in the saved list
   const mergedUsers = useMemo(() => {

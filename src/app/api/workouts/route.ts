@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { get, put } from "@vercel/blob";
+import { BlobPreconditionFailedError, get, put } from "@vercel/blob";
 import { NextRequest, NextResponse } from "next/server";
 import {
   calculateStreaks,
@@ -36,6 +36,7 @@ interface ServerWorkoutsStore {
 type GlobalWithBettermeStore = typeof globalThis & {
   __bettermeStore?: ServerWorkoutsStore;
   __bettermeReadOnlyFallback?: boolean;
+  __bettermeWriteQueue?: Promise<unknown>;
 };
 
 const globalStoreHolder = globalThis as GlobalWithBettermeStore;
@@ -799,7 +800,10 @@ function mergeStores(
   });
 }
 
-async function readServerStore(): Promise<ServerWorkoutsStore> {
+async function readServerStoreWithMeta(): Promise<{
+  store: ServerWorkoutsStore;
+  etag?: string;
+}> {
   const emptyStore: ServerWorkoutsStore = {
     version: 1,
     profiles: {},
@@ -818,12 +822,14 @@ async function readServerStore(): Promise<ServerWorkoutsStore> {
         const parsedBlob = parseStoreJson(rawBlob);
         if (parsedBlob) {
           globalStoreHolder.__bettermeStore = parsedBlob;
-          return parsedBlob;
+          return { store: parsedBlob, etag: blobResult.blob.etag };
         }
       }
     } catch {
       if (globalStoreHolder.__bettermeStore) {
-        return reconcileServerStore(globalStoreHolder.__bettermeStore);
+        return {
+          store: reconcileServerStore(globalStoreHolder.__bettermeStore),
+        };
       }
     }
 
@@ -834,16 +840,18 @@ async function readServerStore(): Promise<ServerWorkoutsStore> {
         const parsedTmp = parseStoreJson(rawTmp);
         if (parsedTmp) {
           globalStoreHolder.__bettermeStore = parsedTmp;
-          return parsedTmp;
+          return { store: parsedTmp };
         }
       }
     } catch {
       // Ignore /tmp read errors
     }
 
-    return globalStoreHolder.__bettermeStore
-      ? reconcileServerStore(globalStoreHolder.__bettermeStore)
-      : emptyStore;
+    return {
+      store: globalStoreHolder.__bettermeStore
+        ? reconcileServerStore(globalStoreHolder.__bettermeStore)
+        : emptyStore,
+    };
   }
 
   const primaryDataFile = getPrimaryDataFile();
@@ -856,7 +864,7 @@ async function readServerStore(): Promise<ServerWorkoutsStore> {
         const parsed = parseStoreJson(raw);
         if (parsed) {
           globalStoreHolder.__bettermeStore = parsed;
-          return parsed;
+          return { store: parsed };
         }
       }
     } catch {
@@ -870,7 +878,7 @@ async function readServerStore(): Promise<ServerWorkoutsStore> {
           const parsedTmp = parseStoreJson(rawTmp);
           if (parsedTmp) {
             globalStoreHolder.__bettermeStore = parsedTmp;
-            return parsedTmp;
+            return { store: parsedTmp };
           }
         }
       } catch {
@@ -878,7 +886,7 @@ async function readServerStore(): Promise<ServerWorkoutsStore> {
       }
     }
 
-    return emptyStore;
+    return { store: emptyStore };
   }
 
   let fileStore: ServerWorkoutsStore | null = null;
@@ -896,7 +904,12 @@ async function readServerStore(): Promise<ServerWorkoutsStore> {
     ? mergeStores(fileStore, memStore)
     : reconcileServerStore(memStore);
   globalStoreHolder.__bettermeStore = combined;
-  return combined;
+  return { store: combined };
+}
+
+async function readServerStore(): Promise<ServerWorkoutsStore> {
+  const { store } = await readServerStoreWithMeta();
+  return store;
 }
 
 async function writeServerStore(store: ServerWorkoutsStore): Promise<void> {
@@ -940,6 +953,86 @@ async function writeServerStore(store: ServerWorkoutsStore): Promise<void> {
       // Even if /tmp is unavailable, globalThis.__bettermeStore retains state in-memory
     }
   }
+}
+
+function isPreconditionFailedError(err: unknown): boolean {
+  if (err instanceof BlobPreconditionFailedError) {
+    return true;
+  }
+  return (
+    Boolean(err) &&
+    typeof err === "object" &&
+    (err as { name?: string }).name === "BlobPreconditionFailedError"
+  );
+}
+
+function cloneServerStore(store: ServerWorkoutsStore): ServerWorkoutsStore {
+  const cloned = JSON.parse(JSON.stringify(store)) as ServerWorkoutsStore;
+  if (!cloned.renames) {
+    cloned.renames = {};
+  }
+  if (!cloned.deletedNicknames) {
+    cloned.deletedNicknames = {};
+  }
+  return cloned;
+}
+
+async function mutateServerStore<T>(
+  mutator: (store: ServerWorkoutsStore) => T
+): Promise<{ store: ServerWorkoutsStore; result: T }> {
+  const previous = globalStoreHolder.__bettermeWriteQueue ?? Promise.resolve();
+  const runTask = async (): Promise<{ store: ServerWorkoutsStore; result: T }> => {
+    if (shouldUseVercelBlob()) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const { store, etag } = await readServerStoreWithMeta();
+        const draftStore = cloneServerStore(store);
+        const result = mutator(draftStore);
+        const cleanStore = reconcileServerStore(draftStore);
+        const serialized = JSON.stringify(cleanStore, null, 2);
+
+        try {
+          await put(BLOB_STORE_PATHNAME, serialized, {
+            access: "private",
+            addRandomSuffix: false,
+            allowOverwrite: true,
+            contentType: "application/json",
+            ...(etag ? { ifMatch: etag } : {}),
+          });
+          globalStoreHolder.__bettermeStore = cleanStore;
+          return { store: cleanStore, result };
+        } catch (err) {
+          if (isPreconditionFailedError(err) && attempt < 4) {
+            await new Promise<void>((resolve) =>
+              setTimeout(resolve, 30 * (attempt + 1))
+            );
+            continue;
+          }
+          if (!isPreconditionFailedError(err)) {
+            await writeServerStore(cleanStore);
+            return { store: cleanStore, result };
+          }
+        }
+      }
+
+      const { store: latestStore } = await readServerStoreWithMeta();
+      const finalDraft = cloneServerStore(latestStore);
+      const finalResult = mutator(finalDraft);
+      const finalClean = reconcileServerStore(finalDraft);
+      await writeServerStore(finalClean);
+      return { store: finalClean, result: finalResult };
+    }
+
+    const store = await readServerStore();
+    const draftStore = cloneServerStore(store);
+    const result = mutator(draftStore);
+    const cleanStore = reconcileServerStore(draftStore);
+    await writeServerStore(cleanStore);
+    return { store: cleanStore, result };
+  };
+
+  const chained = previous.then(runTask, runTask);
+  globalStoreHolder.__bettermeWriteQueue = chained.catch(() => undefined);
+  return chained;
 }
 
 function buildSavedNicknames(
@@ -1083,13 +1176,6 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
   const nowIso = new Date().toISOString();
   const todayKey = resolveTodayKey(body.todayKey);
-  const store = await readServerStore();
-  if (!store.renames) {
-    store.renames = {};
-  }
-  if (!store.deletedNicknames) {
-    store.deletedNicknames = {};
-  }
 
   if (body.action === "rename") {
     const oldTrimmed =
@@ -1106,105 +1192,112 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     const oldKey = normalizeNicknameKey(oldTrimmed);
     const newKey = normalizeNicknameKey(newTrimmed);
-    const oldProfile = store.profiles[oldKey];
-    const targetProfile = store.profiles[newKey];
     const incomingRenameProfile = body.profile
       ? sanitizeProfile(body.profile, nowIso)
       : null;
 
-    let mergedProfile: UserProfileData;
-    if (oldKey === newKey) {
-      const baseSame =
-        oldProfile && incomingRenameProfile
-          ? mergeProfiles(oldProfile, incomingRenameProfile, true)
-          : (oldProfile ?? incomingRenameProfile);
-      const categories = baseSame
-        ? baseSame.categories.map((item) => ({ ...item }))
-        : cloneDefaultCategories();
-      const archivedCategories = baseSame
-        ? sanitizeArchivedCategories(baseSame.archivedCategories, categories)
-        : buildDefaultArchivedCategories();
+    const { store, result: mergedProfile } = await mutateServerStore((draft) => {
+      if (!draft.renames) draft.renames = {};
+      if (!draft.deletedNicknames) draft.deletedNicknames = {};
 
-      mergedProfile = {
-        nickname: newTrimmed,
-        createdAt: baseSame?.createdAt ?? nowIso,
-        updatedAt: nowIso,
-        weeklyGoal: baseSame?.weeklyGoal ?? 4,
-        categories,
-        archivedCategories,
-        ...(baseSame?.categoriesUpdatedAt
-          ? { categoriesUpdatedAt: baseSame.categoriesUpdatedAt }
-          : {}),
-        workouts: baseSame?.workouts ?? {},
-      };
-      store.profiles[newKey] = mergedProfile;
-      delete store.deletedNicknames[newKey];
-    } else {
-      let combinedProfile: UserProfileData | null = null;
-      if (targetProfile && oldProfile) {
-        combinedProfile = mergeProfiles(targetProfile, oldProfile, true);
-      } else {
-        combinedProfile = oldProfile ?? targetProfile ?? null;
-      }
-      if (combinedProfile && incomingRenameProfile) {
-        combinedProfile = mergeProfiles(
-          combinedProfile,
-          incomingRenameProfile,
-          true
-        );
-      } else if (!combinedProfile && incomingRenameProfile) {
-        combinedProfile = incomingRenameProfile;
-      }
+      const oldProfile = draft.profiles[oldKey];
+      const targetProfile = draft.profiles[newKey];
 
-      if (combinedProfile) {
-        mergedProfile = {
-          ...combinedProfile,
+      let nextProfile: UserProfileData;
+      if (oldKey === newKey) {
+        const baseSame =
+          oldProfile && incomingRenameProfile
+            ? mergeProfiles(oldProfile, incomingRenameProfile, true)
+            : (oldProfile ?? incomingRenameProfile);
+        const categories = baseSame
+          ? baseSame.categories.map((item) => ({ ...item }))
+          : cloneDefaultCategories();
+        const archivedCategories = baseSame
+          ? sanitizeArchivedCategories(baseSame.archivedCategories, categories)
+          : buildDefaultArchivedCategories();
+
+        nextProfile = {
           nickname: newTrimmed,
+          createdAt: baseSame?.createdAt ?? nowIso,
           updatedAt: nowIso,
+          weeklyGoal: baseSame?.weeklyGoal ?? 4,
+          categories,
+          archivedCategories,
+          ...(baseSame?.categoriesUpdatedAt
+            ? { categoriesUpdatedAt: baseSame.categoriesUpdatedAt }
+            : {}),
+          workouts: baseSame?.workouts ?? {},
         };
+        draft.profiles[newKey] = nextProfile;
+        delete draft.deletedNicknames[newKey];
       } else {
-        mergedProfile = {
-          nickname: newTrimmed,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          weeklyGoal: 4,
-          categories: cloneDefaultCategories(),
-          archivedCategories: buildDefaultArchivedCategories(),
-          workouts: {},
-        };
-      }
-      store.profiles[newKey] = mergedProfile;
-      delete store.profiles[oldKey];
+        let combinedProfile: UserProfileData | null = null;
+        if (targetProfile && oldProfile) {
+          combinedProfile = mergeProfiles(targetProfile, oldProfile, true);
+        } else {
+          combinedProfile = oldProfile ?? targetProfile ?? null;
+        }
+        if (combinedProfile && incomingRenameProfile) {
+          combinedProfile = mergeProfiles(
+            combinedProfile,
+            incomingRenameProfile,
+            true
+          );
+        } else if (!combinedProfile && incomingRenameProfile) {
+          combinedProfile = incomingRenameProfile;
+        }
 
-      store.renames[oldKey] = {
-        targetNickname: newTrimmed,
-        renamedAt: nowIso,
-      };
-      for (const [k, rec] of Object.entries(store.renames)) {
-        if (normalizeNicknameKey(rec.targetNickname) === oldKey) {
-          store.renames[k] = {
-            targetNickname: newTrimmed,
-            renamedAt: nowIso,
+        if (combinedProfile) {
+          nextProfile = {
+            ...combinedProfile,
+            nickname: newTrimmed,
+            updatedAt: nowIso,
+          };
+        } else {
+          nextProfile = {
+            nickname: newTrimmed,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            weeklyGoal: 4,
+            categories: cloneDefaultCategories(),
+            archivedCategories: buildDefaultArchivedCategories(),
+            workouts: {},
           };
         }
-      }
-      delete store.renames[newKey];
-      delete store.deletedNicknames[newKey];
-      delete store.deletedNicknames[oldKey];
-    }
+        draft.profiles[newKey] = nextProfile;
+        delete draft.profiles[oldKey];
 
-    await writeServerStore(store);
+        draft.renames[oldKey] = {
+          targetNickname: newTrimmed,
+          renamedAt: nowIso,
+        };
+        for (const [k, rec] of Object.entries(draft.renames)) {
+          if (normalizeNicknameKey(rec.targetNickname) === oldKey) {
+            draft.renames[k] = {
+              targetNickname: newTrimmed,
+              renamedAt: nowIso,
+            };
+          }
+        }
+        delete draft.renames[newKey];
+        delete draft.deletedNicknames[newKey];
+        delete draft.deletedNicknames[oldKey];
+      }
+
+      return nextProfile;
+    });
+
     const savedNicknames = buildSavedNicknames(store.profiles);
     const leaderboard = buildLeaderboard(store.profiles, todayKey);
 
     return NextResponse.json(
       {
         ok: true,
-        profile: mergedProfile,
+        profile: store.profiles[newKey] ?? mergedProfile,
         savedNicknames,
         leaderboard,
-        renames: store.renames,
-        deletedNicknames: store.deletedNicknames,
+        renames: store.renames ?? {},
+        deletedNicknames: store.deletedNicknames ?? {},
       },
       { headers: { "Cache-Control": "no-store" } }
     );
@@ -1221,19 +1314,24 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     const targetKey = normalizeNicknameKey(trimmed);
-    delete store.profiles[targetKey];
-    store.deletedNicknames[targetKey] = nowIso;
 
-    for (const [k, rec] of Object.entries(store.renames)) {
-      if (
-        k === targetKey ||
-        normalizeNicknameKey(rec.targetNickname) === targetKey
-      ) {
-        delete store.renames[k];
+    const { store } = await mutateServerStore((draft) => {
+      if (!draft.renames) draft.renames = {};
+      if (!draft.deletedNicknames) draft.deletedNicknames = {};
+
+      delete draft.profiles[targetKey];
+      draft.deletedNicknames[targetKey] = nowIso;
+
+      for (const [k, rec] of Object.entries(draft.renames)) {
+        if (
+          k === targetKey ||
+          normalizeNicknameKey(rec.targetNickname) === targetKey
+        ) {
+          delete draft.renames[k];
+        }
       }
-    }
+    });
 
-    await writeServerStore(store);
     const savedNicknames = buildSavedNicknames(store.profiles);
     const leaderboard = buildLeaderboard(store.profiles, todayKey);
 
@@ -1243,8 +1341,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         deletedNickname: targetKey,
         savedNicknames,
         leaderboard,
-        renames: store.renames,
-        deletedNicknames: store.deletedNicknames,
+        renames: store.renames ?? {},
+        deletedNicknames: store.deletedNicknames ?? {},
       },
       { headers: { "Cache-Control": "no-store" } }
     );
@@ -1268,139 +1366,136 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     const key = normalizeNicknameKey(incomingProfile.nickname);
-    const renameInfo = resolveRenameChain(key, store.renames);
 
-    if (renameInfo) {
-      if (
-        allowCreateNew &&
-        compareIsoTimestamps(incomingProfile.createdAt, renameInfo.renamedAt) > 0
-      ) {
-        delete store.renames[key];
-      } else {
-        const targetKey = renameInfo.targetKey;
-        const targetDeletedAt = store.deletedNicknames[targetKey];
+    const { store, result } = await mutateServerStore<{
+      profile: UserProfileData | null;
+      deleted?: boolean;
+      redirectedFrom?: string;
+    }>((draft) => {
+      if (!draft.renames) draft.renames = {};
+      if (!draft.deletedNicknames) draft.deletedNicknames = {};
+
+      const renameInfo = resolveRenameChain(key, draft.renames);
+
+      if (renameInfo) {
         if (
-          targetDeletedAt &&
-          compareIsoTimestamps(incomingProfile.createdAt, targetDeletedAt) <= 0
+          allowCreateNew &&
+          compareIsoTimestamps(incomingProfile.createdAt, renameInfo.renamedAt) >
+            0
         ) {
-          delete store.profiles[key];
-          delete store.profiles[targetKey];
-          await writeServerStore(store);
-          const savedNicknames = buildSavedNicknames(store.profiles);
-          const leaderboard = buildLeaderboard(store.profiles, todayKey);
-          return NextResponse.json(
-            {
-              ok: true,
-              profile: null,
-              deleted: true,
-              savedNicknames,
-              leaderboard,
-              renames: store.renames,
-              deletedNicknames: store.deletedNicknames,
-            },
-            { headers: { "Cache-Control": "no-store" } }
-          );
+          delete draft.renames[key];
+        } else {
+          const targetKey = renameInfo.targetKey;
+          const targetDeletedAt = draft.deletedNicknames[targetKey];
+          if (
+            targetDeletedAt &&
+            compareIsoTimestamps(incomingProfile.createdAt, targetDeletedAt) <= 0
+          ) {
+            delete draft.profiles[key];
+            delete draft.profiles[targetKey];
+            return { profile: null, deleted: true };
+          }
+
+          const existingTarget = draft.profiles[targetKey];
+          const redirectedProfile: UserProfileData = existingTarget
+            ? {
+                ...mergeProfiles(
+                  existingTarget,
+                  {
+                    ...incomingProfile,
+                    weeklyGoal:
+                      typeof rawProfile?.weeklyGoal === "number"
+                        ? incomingProfile.weeklyGoal
+                        : existingTarget.weeklyGoal,
+                  },
+                  hasExplicitUpdatedAt
+                ),
+                nickname: existingTarget.nickname,
+              }
+            : {
+                ...incomingProfile,
+                nickname: renameInfo.targetNickname,
+              };
+
+          draft.profiles[targetKey] = redirectedProfile;
+          delete draft.profiles[key];
+          return { profile: redirectedProfile, redirectedFrom: key };
         }
+      }
 
-        const existingTarget = store.profiles[targetKey];
-        const redirectedProfile: UserProfileData = existingTarget
-          ? {
-              ...mergeProfiles(
-                existingTarget,
-                {
-                  ...incomingProfile,
-                  weeklyGoal:
-                    typeof rawProfile?.weeklyGoal === "number"
-                      ? incomingProfile.weeklyGoal
-                      : existingTarget.weeklyGoal,
-                },
-                hasExplicitUpdatedAt
-              ),
-              nickname: existingTarget.nickname,
-            }
-          : {
+      const deletedAt = draft.deletedNicknames[key];
+      if (deletedAt) {
+        if (
+          allowCreateNew &&
+          compareIsoTimestamps(incomingProfile.createdAt, deletedAt) > 0
+        ) {
+          delete draft.deletedNicknames[key];
+        } else {
+          delete draft.profiles[key];
+          return { profile: null, deleted: true };
+        }
+      }
+
+      const existingProfile = draft.profiles[key];
+      const mergedProfile: UserProfileData = existingProfile
+        ? mergeProfiles(
+            existingProfile,
+            {
               ...incomingProfile,
-              nickname: renameInfo.targetNickname,
-            };
+              weeklyGoal:
+                typeof rawProfile?.weeklyGoal === "number"
+                  ? incomingProfile.weeklyGoal
+                  : existingProfile.weeklyGoal,
+            },
+            hasExplicitUpdatedAt
+          )
+        : incomingProfile;
 
-        store.profiles[targetKey] = redirectedProfile;
-        delete store.profiles[key];
+      draft.profiles[key] = mergedProfile;
+      return { profile: mergedProfile };
+    });
 
-        await writeServerStore(store);
-        const savedNicknames = buildSavedNicknames(store.profiles);
-        const leaderboard = buildLeaderboard(store.profiles, todayKey);
-
-        return NextResponse.json(
-          {
-            ok: true,
-            profile: store.profiles[targetKey],
-            redirectedFrom: key,
-            savedNicknames,
-            leaderboard,
-            renames: store.renames,
-            deletedNicknames: store.deletedNicknames,
-          },
-          { headers: { "Cache-Control": "no-store" } }
-        );
-      }
-    }
-
-    const deletedAt = store.deletedNicknames[key];
-    if (deletedAt) {
-      if (
-        allowCreateNew &&
-        compareIsoTimestamps(incomingProfile.createdAt, deletedAt) > 0
-      ) {
-        delete store.deletedNicknames[key];
-      } else {
-        delete store.profiles[key];
-        await writeServerStore(store);
-        const savedNicknames = buildSavedNicknames(store.profiles);
-        const leaderboard = buildLeaderboard(store.profiles, todayKey);
-
-        return NextResponse.json(
-          {
-            ok: true,
-            profile: null,
-            deleted: true,
-            savedNicknames,
-            leaderboard,
-            renames: store.renames,
-            deletedNicknames: store.deletedNicknames,
-          },
-          { headers: { "Cache-Control": "no-store" } }
-        );
-      }
-    }
-
-    const existingProfile = store.profiles[key];
-    const mergedProfile: UserProfileData = existingProfile
-      ? mergeProfiles(
-          existingProfile,
-          {
-            ...incomingProfile,
-            weeklyGoal:
-              typeof rawProfile?.weeklyGoal === "number"
-                ? incomingProfile.weeklyGoal
-                : existingProfile.weeklyGoal,
-          },
-          hasExplicitUpdatedAt
-        )
-      : incomingProfile;
-
-    store.profiles[key] = mergedProfile;
-    await writeServerStore(store);
     const savedNicknames = buildSavedNicknames(store.profiles);
     const leaderboard = buildLeaderboard(store.profiles, todayKey);
+
+    if (result.deleted) {
+      return NextResponse.json(
+        {
+          ok: true,
+          profile: null,
+          deleted: true,
+          savedNicknames,
+          leaderboard,
+          renames: store.renames ?? {},
+          deletedNicknames: store.deletedNicknames ?? {},
+        },
+        { headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    if (result.redirectedFrom) {
+      return NextResponse.json(
+        {
+          ok: true,
+          profile: result.profile,
+          redirectedFrom: result.redirectedFrom,
+          savedNicknames,
+          leaderboard,
+          renames: store.renames ?? {},
+          deletedNicknames: store.deletedNicknames ?? {},
+        },
+        { headers: { "Cache-Control": "no-store" } }
+      );
+    }
 
     return NextResponse.json(
       {
         ok: true,
-        profile: mergedProfile,
+        profile: result.profile,
         savedNicknames,
         leaderboard,
-        renames: store.renames,
-        deletedNicknames: store.deletedNicknames,
+        renames: store.renames ?? {},
+        deletedNicknames: store.deletedNicknames ?? {},
       },
       { headers: { "Cache-Control": "no-store" } }
     );

@@ -83,6 +83,19 @@ function sortLeaderboardEntries(
   });
 }
 
+function getPrimaryMetricValue(
+  entry: LeaderboardEntry,
+  sortBy: LeaderboardSortBy
+): number {
+  if (sortBy === "month") {
+    return entry.monthCompleted;
+  }
+  if (sortBy === "streak") {
+    return entry.currentStreak;
+  }
+  return entry.totalCompleted;
+}
+
 function formatPrimaryScore(
   entry: LeaderboardEntry,
   sortBy: LeaderboardSortBy
@@ -133,24 +146,60 @@ export default function LeaderboardView({
 }: LeaderboardViewProps): JSX.Element {
   const [sortBy, setSortBy] = useState<LeaderboardSortBy>("month");
   const [refreshing, setRefreshing] = useState(false);
+  const [monthSubtitle, setMonthSubtitle] = useState<string>(() =>
+    getCurrentMonthLabel()
+  );
 
   useEffect(() => {
     void onRefresh();
   }, [onRefresh]);
+
+  useEffect(() => {
+    const syncMonthLabel = () => {
+      if (document.visibilityState && document.visibilityState !== "visible") {
+        return;
+      }
+      const nextLabel = getCurrentMonthLabel();
+      setMonthSubtitle((prev) => (prev === nextLabel ? prev : nextLabel));
+    };
+    window.addEventListener("focus", syncMonthLabel);
+    document.addEventListener("visibilitychange", syncMonthLabel);
+    return () => {
+      window.removeEventListener("focus", syncMonthLabel);
+      document.removeEventListener("visibilitychange", syncMonthLabel);
+    };
+  }, []);
 
   const sortedEntries = useMemo(
     () => sortLeaderboardEntries(entries, sortBy),
     [entries, sortBy]
   );
 
+  const displayRanks = useMemo(() => {
+    const ranks: number[] = [];
+    for (let idx = 0; idx < sortedEntries.length; idx += 1) {
+      if (
+        idx > 0 &&
+        getPrimaryMetricValue(sortedEntries[idx], sortBy) ===
+          getPrimaryMetricValue(sortedEntries[idx - 1], sortBy)
+      ) {
+        ranks.push(ranks[idx - 1]);
+      } else {
+        ranks.push(idx + 1);
+      }
+    }
+    return ranks;
+  }, [sortedEntries, sortBy]);
+
   const normalizedMe = currentNickname.trim().toLowerCase();
   const myIndex = sortedEntries.findIndex(
     (item) => item.nickname.trim().toLowerCase() === normalizedMe
   );
   const myEntry = myIndex >= 0 ? sortedEntries[myIndex] : null;
-  const myRank = myIndex >= 0 ? myIndex + 1 : null;
-
-  const monthSubtitle = useMemo(() => getCurrentMonthLabel(), []);
+  const myRank = myIndex >= 0 ? displayRanks[myIndex] : null;
+  const isMyRankTied =
+    myRank !== null &&
+    displayRanks.filter((rankVal) => rankVal === myRank).length > 1;
 
   const handleManualRefresh = async () => {
     if (refreshing || syncing) return;
@@ -211,7 +260,7 @@ export default function LeaderboardView({
                 내 순위
               </span>
               <span className="text-xs font-bold text-[#2C2A27] truncate">
-                현재 {myRank}위{" "}
+                {isMyRankTied ? `공동 ${myRank}위` : `현재 ${myRank}위`}{" "}
                 <span className="font-medium text-[#6C665C]">
                   / 총 {sortedEntries.length}명
                 </span>
@@ -264,7 +313,7 @@ export default function LeaderboardView({
           </div>
         ) : (
           sortedEntries.map((entry, idx) => {
-            const rank = idx + 1;
+            const rank = displayRanks[idx] ?? idx + 1;
             const isMe =
               entry.nickname.trim().toLowerCase() === normalizedMe;
             const rankBadge = getRankBadgeStyle(rank);

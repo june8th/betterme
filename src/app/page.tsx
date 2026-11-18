@@ -165,6 +165,7 @@ export default function HomePage() {
             onSwitchNickname={loginWithNickname}
             onRenameNickname={renameActiveNickname}
             onDeleteNickname={deleteSavedNickname}
+            onRefreshDirectory={refreshLeaderboard}
             onLogout={logoutNickname}
           />
         ) : (
