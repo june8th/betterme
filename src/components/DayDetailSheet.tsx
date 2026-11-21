@@ -174,7 +174,7 @@ export default function DayDetailSheet({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end justify-center bg-[#231F1B]/45 backdrop-blur-[2px]"
+      className="fixed inset-0 !mt-0 z-50 flex items-end justify-center bg-[#231F1B]/45 backdrop-blur-[2px]"
       onClick={onClose}
       role="dialog"
       aria-modal="true"

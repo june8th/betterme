@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef } from "react";
 
 export interface PullToRefreshProps {
   onRefresh: () => Promise<void> | void;
@@ -15,6 +15,8 @@ const RESISTANCE_K = 125;
 const RADIUS = 9.5;
 const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
 const RETRACT_MS = 260;
+const BRAND_GREEN = "#6CA824";
+const RING_NEUTRAL = "#6D6559";
 
 function getWindowScrollTop(): number {
   if (typeof window === "undefined") return 0;
@@ -57,15 +59,16 @@ function shouldIgnoreTouchTarget(target: EventTarget | null): boolean {
 }
 
 function indicatorOffsetY(pullPx: number): number {
-  return Math.max(-16, pullPx * 0.5 - 18);
+  return Math.max(-18, pullPx * 0.5 - 18);
 }
 
 export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
-  const [refreshing, setRefreshing] = useState(false);
-
   const containerRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const indicatorRef = useRef<HTMLDivElement>(null);
+  const liveRegionRef = useRef<HTMLDivElement>(null);
+  const ringSvgRef = useRef<SVGSVGElement>(null);
+  const spinnerSvgRef = useRef<SVGSVGElement>(null);
   const ringCircleRef = useRef<SVGCircleElement>(null);
 
   const onRefreshRef = useRef(onRefresh);
@@ -94,6 +97,21 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
       }
     };
 
+    const setSpinnerMode = (active: boolean) => {
+      if (ringSvgRef.current) {
+        ringSvgRef.current.style.display = active ? "none" : "block";
+      }
+      if (spinnerSvgRef.current) {
+        spinnerSvgRef.current.style.display = active ? "block" : "none";
+      }
+      if (liveRegionRef.current) {
+        liveRegionRef.current.setAttribute(
+          "aria-hidden",
+          active ? "false" : "true"
+        );
+      }
+    };
+
     const resetIdleStyles = () => {
       const contentEl = contentRef.current;
       const indicatorEl = indicatorRef.current;
@@ -106,14 +124,15 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
       }
       if (indicatorEl) {
         indicatorEl.style.transition = "";
-        indicatorEl.style.transform = "translate3d(0, -16px, 0) scale(0.76)";
+        indicatorEl.style.transform = "translate3d(0, -18px, 0) scale(0.76)";
         indicatorEl.style.opacity = "0";
         indicatorEl.style.willChange = "";
       }
       if (ringEl) {
         ringEl.style.strokeDashoffset = `${CIRCUMFERENCE}`;
-        ringEl.style.stroke = "#6D6559";
+        ringEl.style.stroke = RING_NEUTRAL;
       }
+      setSpinnerMode(false);
     };
 
     const applyVisualPull = (pullPx: number) => {
@@ -137,7 +156,7 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
       }
       if (ringEl) {
         ringEl.style.strokeDashoffset = `${(CIRCUMFERENCE * (1 - progress)).toFixed(2)}`;
-        ringEl.style.stroke = progress >= 1 ? "#3F7A52" : "#6D6559";
+        ringEl.style.stroke = progress >= 1 ? BRAND_GREEN : RING_NEUTRAL;
       }
 
       if (progress >= 1 && !crossedThreshold) {
@@ -171,7 +190,7 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
       }
       if (indicatorEl) {
         indicatorEl.style.transition = `transform ${RETRACT_MS}ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease`;
-        indicatorEl.style.transform = "translate3d(0, -16px, 0) scale(0.76)";
+        indicatorEl.style.transform = "translate3d(0, -18px, 0) scale(0.76)";
         indicatorEl.style.opacity = "0";
       }
 
@@ -179,10 +198,11 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
         retractTimerRef.current = null;
         if (!mountedRef.current) return;
         refreshingRef.current = false;
-        setRefreshing(false);
         resetIdleStyles();
       }, RETRACT_MS + 10);
     };
+
+    resetIdleStyles();
 
     const handleTouchStart = (event: TouchEvent) => {
       if (refreshingRef.current) return;
@@ -190,8 +210,6 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
       if (getWindowScrollTop() > 0) return;
       if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
       if (shouldIgnoreTouchTarget(event.target)) return;
-
-      clearRetractTimer();
 
       const touch = event.touches[0];
       tracking = true;
@@ -235,13 +253,14 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
         }
 
         pulling = true;
+        clearRetractTimer();
+        setSpinnerMode(false);
         if (contentRef.current) {
           contentRef.current.style.transition = "none";
           contentRef.current.style.willChange = "transform";
         }
         if (indicatorRef.current) {
-          indicatorRef.current.style.transition = "none";
-          indicatorRef.current.style.willChange = "transform, opacity";
+          indicatorElResetBeforePull(indicatorRef.current);
         }
       }
 
@@ -269,7 +288,11 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
       tracking = false;
       pulling = false;
 
-      if (!wasPulling || releasedPull <= 0) {
+      if (!wasPulling) {
+        return;
+      }
+
+      if (releasedPull <= 0) {
         resetIdleStyles();
         return;
       }
@@ -280,7 +303,7 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
       }
 
       refreshingRef.current = true;
-      setRefreshing(true);
+      setSpinnerMode(true);
 
       const contentEl = contentRef.current;
       const indicatorEl = indicatorRef.current;
@@ -330,71 +353,64 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
   }, []);
 
   return (
-    <div
-      ref={containerRef}
-      className="relative flex-1 flex flex-col overflow-x-clip"
-    >
+    <div ref={containerRef} className="relative flex-1 flex flex-col">
       <div
+        ref={liveRegionRef}
         aria-live="polite"
-        aria-hidden={!refreshing}
-        className="pointer-events-none absolute inset-x-0 top-0 z-10 flex justify-center"
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 top-0 z-10 flex h-32 justify-center overflow-hidden"
       >
         <div
           ref={indicatorRef}
-          style={{
-            opacity: 0,
-            transform: "translate3d(0, -16px, 0) scale(0.76)",
-          }}
-          className="flex h-9 w-9 items-center justify-center rounded-full border border-[#EAE3D5] bg-white/95 shadow-[0_2px_10px_rgba(44,42,39,0.08)]"
+          className="flex h-9 w-9 items-center justify-center rounded-full border border-[#EAE3D5] bg-white/95 opacity-0 shadow-[0_2px_10px_rgba(44,42,39,0.08)]"
         >
-          {refreshing ? (
-            <svg
-              className="h-5 w-5 animate-spin text-[#3F7A52]"
-              viewBox="0 0 24 24"
-              fill="none"
-              aria-hidden="true"
-            >
-              <circle
-                cx="12"
-                cy="12"
-                r={RADIUS}
-                stroke="#E8E1D3"
-                strokeWidth="2.25"
-              />
-              <path
-                d="M12 2.5a9.5 9.5 0 0 1 9.5 9.5"
-                stroke="currentColor"
-                strokeWidth="2.25"
-                strokeLinecap="round"
-              />
-            </svg>
-          ) : (
-            <svg
-              className="h-5 w-5 -rotate-90"
-              viewBox="0 0 24 24"
-              fill="none"
-              aria-hidden="true"
-            >
-              <circle
-                cx="12"
-                cy="12"
-                r={RADIUS}
-                stroke="#EAE3D5"
-                strokeWidth="2.25"
-              />
-              <circle
-                ref={ringCircleRef}
-                cx="12"
-                cy="12"
-                r={RADIUS}
-                stroke="#6D6559"
-                strokeWidth="2.25"
-                strokeLinecap="round"
-                strokeDasharray={CIRCUMFERENCE}
-                strokeDashoffset={CIRCUMFERENCE}
-              />
-            </svg>
-          )}
+          <svg
+            ref={ringSvgRef}
+            className="h-5 w-5 -rotate-90"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <circle
+              cx="12"
+              cy="12"
+              r={RADIUS}
+              stroke="#EAE3D5"
+              strokeWidth="2.25"
+            />
+            <circle
+              ref={ringCircleRef}
+              cx="12"
+              cy="12"
+              r={RADIUS}
+              stroke={RING_NEUTRAL}
+              strokeWidth="2.25"
+              strokeLinecap="round"
+              strokeDasharray={CIRCUMFERENCE}
+              strokeDashoffset={CIRCUMFERENCE}
+            />
+          </svg>
+          <svg
+            ref={spinnerSvgRef}
+            className="hidden h-5 w-5 animate-spin text-[#6CA824]"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <circle
+              cx="12"
+              cy="12"
+              r={RADIUS}
+              stroke="#E8E1D3"
+              strokeWidth="2.25"
+            />
+            <path
+              d="M12 2.5a9.5 9.5 0 0 1 9.5 9.5"
+              stroke="currentColor"
+              strokeWidth="2.25"
+              strokeLinecap="round"
+            />
+          </svg>
         </div>
       </div>
 
@@ -405,5 +421,9 @@ export function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
   );
 }
 
-export default PullToRefresh;
+function indicatorElResetBeforePull(indicatorEl: HTMLDivElement): void {
+  indicatorEl.style.transition = "none";
+  indicatorEl.style.willChange = "transform, opacity";
+}
 
+export default PullToRefresh;
